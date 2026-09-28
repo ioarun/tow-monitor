@@ -69,7 +69,7 @@
   button, .filebtn {
     font:inherit; font-size:13px; font-weight:500; padding:10px 12px; border-radius:8px;
     background:#1b262b; color:var(--ink); border:1px solid var(--rule); cursor:pointer;
-    flex:1; text-align:center; white-space:nowrap;
+    flex:1; text-align:center; white-space:nowrap; text-decoration:none; display:block;
   }
   button.go { background:var(--cyan); color:#06232a; border-color:var(--cyan); }
   button.stop { background:var(--red); color:#2a0d0b; border-color:var(--red); }
@@ -129,18 +129,7 @@
     </div>
 
     <section>
-      <span class="lbl">1 · Calibrate</span>
-      <p class="note">Record one full depletion at the start of the session, then pick it
-        here. The first and last frames are all it needs.</p>
-      <div class="row">
-        <input type="file" id="calFile" accept="video/*" class="hidden">
-        <button onclick="calFile.click()">Pick depletion video</button>
-      </div>
-      <p class="note" id="calNote"></p>
-    </section>
-
-    <section>
-      <span class="lbl">2 · Source</span>
+      <span class="lbl">1 · Source</span>
       <div class="row">
         <button class="seg" id="srcCam">Live camera</button>
         <button class="seg" id="srcFile">Video file</button>
@@ -149,6 +138,25 @@
       <div class="row hidden" id="rateRow">
         <span class="note" style="margin:0">speed</span>
         <button id="rateDown">−</button><span id="rateVal" class="note" style="margin:0">1×</span><button id="rateUp">+</button>
+      </div>
+    </section>
+
+    <section>
+      <span class="lbl">2 · Calibrate</span>
+      <p class="note" id="recHint">Start recording on a full bobbin, stop once the core is
+        bare. Calibration is instant — the app keeps the two frames itself, so nothing
+        has to be read back.</p>
+      <div class="row">
+        <button id="recBtn" disabled>● Record depletion</button>
+      </div>
+      <div class="row hidden" id="recAfter">
+        <button id="recUse">Replay it</button>
+        <a id="recSave" class="filebtn" download="depletion.mp4">Save clip</a>
+      </div>
+      <p class="note" id="calNote"></p>
+      <div class="row">
+        <input type="file" id="calFile" accept="video/*" class="hidden">
+        <button onclick="calFile.click()">Calibrate from a saved video instead</button>
       </div>
     </section>
 
@@ -215,6 +223,7 @@ let source = null;                // "cam" | "file"
 let stream = null, running = false, rafId = null, wakeLock = null;
 let lastSampleT = -Infinity, window_ = [], clamped = 0, consecutive = 0;
 let fired = false, audio = null, flashTimer = null;
+let recording = false;
 
 /* ---- setup restore ---------------------------------------------------- */
 $("topic").value = store.get("topic", "");
@@ -305,18 +314,9 @@ $("calFile").onchange = async e => {
     const bare = await shot(Math.max(0, dur - 0.2));
 
     note.textContent = "fitting…";
-    const fresh = CV.calibrate(wound, bare);
-    fresh.refSmall = Array.from(CV.downsampleGray(wound, 32, 18));
-    cal = fresh; refSmall = Float32Array.from(fresh.refSmall);
-    store.set("cal", fresh);
-    paintCalChip();
-    note.className = "note ok";
-    note.textContent = `Fitted on ${wound.width}×${wound.height}` +
-      (probe.videoWidth > wound.width ? ` (from ${probe.videoWidth}×${probe.videoHeight})` : "") +
-      `. Reads ` +
-      `${fresh.baselinePct}% on a full bobbin and ${fresh.ceilingPct}% when bare — ` +
-      `a ${(fresh.ceilingPct - fresh.baselinePct).toFixed(0)} point span.`;
-    updateStart();
+    applyCalibration(wound, bare,
+      probe.videoWidth > wound.width
+        ? `video (downscaled from ${probe.videoWidth}×${probe.videoHeight})` : "video");
   } catch (err) {
     note.className = "note bad";
     note.textContent = err.message;
@@ -334,7 +334,11 @@ $("srcCam").onclick = async () => {
   stopRun(); releaseFile();
   try {
     stream = await navigator.mediaDevices.getUserMedia({
-      video: { facingMode: "environment", width: { ideal: 1920 }, height: { ideal: 1080 } },
+      // Asking for 1080p or 4K buys nothing: analysis is capped at
+      // CV.ANALYSIS_MAX regardless, and the larger stream costs decode time,
+      // canvas bandwidth and battery to be thrown away a moment later.
+      video: { facingMode: "environment",
+               width: { ideal: CV.ANALYSIS_MAX }, height: { ideal: 720 } },
       audio: false,
     });
   } catch (err) {
@@ -347,6 +351,9 @@ $("srcCam").onclick = async () => {
   vid.controls = false; await vid.play();
   source = "cam"; segment("srcCam"); $("rateRow").classList.add("hidden");
   showStage(true); sizeOverlay(); updateStart();
+  const t = stream.getVideoTracks()[0].getSettings();
+  $("recHint").textContent = `Camera at ${t.width}×${t.height}. Start recording on a full ` +
+    `bobbin, stop once the core is bare — calibration is instant.`;
 };
 
 $("srcFile").onclick = () => $("playFile").click();
@@ -371,6 +378,134 @@ function segment(onId) {
 function stopCamera() { if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; } }
 function releaseFile() { if (vid.src) { vid.pause(); vid.removeAttribute("src"); vid.load(); } }
 
+/* ---- recording a depletion --------------------------------------------
+   Picking a clip out of Photos was the slow step, and encoding is not what
+   made it slow: iOS exports and transcodes the original before handing it
+   over, which on a 4K HEVC recording is most of a minute of staring at a
+   spinner for a file we then immediately downscale.
+   
+   So calibration never goes near a file. The two frames it needs are grabbed
+   straight off the live camera -- one when recording starts, one when it
+   stops -- and they are already ImageData at analysis resolution by the time
+   the button comes back up. The MediaRecorder running alongside is only there
+   to leave you a clip for the eval set. If it fails, or Safari refuses the
+   codec, calibration is unaffected. */
+const REC_FPS = 5;                 // the run is sampled at 2 fps; 5 is headroom
+const REC_BITRATE = 1_200_000;     // ~9 MB for a six-minute depletion
+const recCanvas = document.createElement("canvas");
+const recCtx = recCanvas.getContext("2d");
+let recorder = null, recChunks = [], recDraw = null, recTick = null;
+let recWound = null, recStartedAt = 0, recordedURL = null;
+
+function pickMime() {
+  if (!window.MediaRecorder) return null;
+  return ["video/mp4;codecs=avc1.42E01E", "video/mp4", "video/webm;codecs=vp9", "video/webm"]
+    .find(t => { try { return MediaRecorder.isTypeSupported(t); } catch { return false; } }) || null;
+}
+
+$("recBtn").onclick = () => recording ? stopRecording() : startRecording();
+
+function startRecording() {
+  if (source !== "cam" || !vid.videoWidth) return;
+  recWound = analyseFrom(vid);
+  if (!recWound) return;
+  recording = true;
+  recStartedAt = Date.now();
+  recChunks = [];
+  $("recBtn").textContent = "■ Stop & calibrate";
+  $("recBtn").className = "stop";
+  $("recAfter").classList.add("hidden");
+  $("calNote").className = "note";
+
+  const mime = pickMime();
+  if (mime) {
+    const [aw, ah] = CV.fitInto(vid.videoWidth, vid.videoHeight);
+    recCanvas.width = aw; recCanvas.height = ah;
+    try {
+      recorder = new MediaRecorder(recCanvas.captureStream(REC_FPS),
+                                   { mimeType: mime, videoBitsPerSecond: REC_BITRATE });
+      recorder.ondataavailable = e => { if (e.data.size) recChunks.push(e.data); };
+      recorder.start();
+      recDraw = setInterval(() => recCtx.drawImage(vid, 0, 0, aw, ah), 1000 / REC_FPS);
+    } catch { recorder = null; }     // calibration does not need it
+  }
+
+  recTick = setInterval(() => {
+    const s = (Date.now() - recStartedAt) / 1000;
+    $("calNote").textContent = `recording ${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")}` +
+      (recorder ? "" : " (frames only — this browser will not encode a clip)");
+  }, 500);
+}
+
+async function stopRecording() {
+  recording = false;
+  clearInterval(recDraw); clearInterval(recTick);
+  const bare = analyseFrom(vid);
+  $("recBtn").textContent = "● Record depletion";
+  $("recBtn").className = "";
+
+  if (recorder && recorder.state !== "inactive") {
+    await new Promise(res => { recorder.onstop = res; recorder.stop(); });
+    const blob = new Blob(recChunks, { type: recorder.mimeType || "video/mp4" });
+    if (recordedURL) URL.revokeObjectURL(recordedURL);
+    recordedURL = URL.createObjectURL(blob);
+    const ext = (recorder.mimeType || "").includes("webm") ? "webm" : "mp4";
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    $("recSave").href = recordedURL;
+    $("recSave").download = `depletion-${stamp}.${ext}`;
+    $("recSave").textContent = `Save clip (${(blob.size / 1e6).toFixed(1)} MB)`;
+    $("recAfter").classList.remove("hidden");
+  }
+  recorder = null;
+
+  // Recalibrating mid-run would move the ROI under a measurement already in
+  // progress and reset nothing, so the percentages either side of it would not
+  // describe the same thing. Keep the clip, leave the calibration alone.
+  if (running) {
+    $("calNote").className = "note warn";
+    $("calNote").textContent = "Clip saved. Calibration left alone — a run is in progress.";
+  } else {
+    applyCalibration(recWound, bare, "recording");
+  }
+  recWound = null;
+}
+
+$("recUse").onclick = async () => {
+  if (!recordedURL) return;
+  stopRun(); stopCamera();
+  vid.srcObject = null;
+  try { await loadVideo(vid, recordedURL); } catch (err) {
+    $("calNote").className = "note bad"; $("calNote").textContent = err.message; return;
+  }
+  vid.controls = true; vid.playbackRate = rate;
+  source = "file"; segment("srcFile"); $("rateRow").classList.remove("hidden");
+  showStage(true); sizeOverlay(); updateStart();
+};
+
+/* Shared by the recorder and the file picker: the only difference between them
+   is where the two frames came from. */
+function applyCalibration(wound, bare, origin) {
+  const note = $("calNote");
+  try {
+    const fresh = CV.calibrate(wound, bare);
+    fresh.refSmall = Array.from(CV.downsampleGray(wound, 32, 18));
+    cal = fresh;
+    refSmall = Float32Array.from(fresh.refSmall);
+    store.set("cal", fresh);
+    paintCalChip();
+    note.className = "note ok";
+    note.textContent = `Calibrated from the ${origin} at ${wound.width}×${wound.height}. ` +
+      `Reads ${fresh.baselinePct}% on a full bobbin and ${fresh.ceilingPct}% when bare — ` +
+      `a ${(fresh.ceilingPct - fresh.baselinePct).toFixed(0)} point span.`;
+    updateStart();
+    return true;
+  } catch (err) {
+    note.className = "note bad";
+    note.textContent = err.message;
+    return false;
+  }
+}
+
 let rate = 1;
 $("rateUp").onclick = () => setRate(Math.min(8, rate * 2));
 $("rateDown").onclick = () => setRate(Math.max(1, rate / 2));
@@ -378,6 +513,7 @@ function setRate(r) { rate = r; vid.playbackRate = r; $("rateVal").textContent =
 
 function updateStart() {
   $("start").disabled = !(cal && source);
+  $("recBtn").disabled = source !== "cam" || recording;
   checkAspect();
 }
 
@@ -473,6 +609,7 @@ async function startRun() {
   try { wakeLock = await navigator.wakeLock?.request("screen"); } catch {}
   if (source === "file") { vid.playbackRate = rate; await vid.play(); }
   running = true;
+  updateStart();
   $("start").textContent = "Stop"; $("start").className = "stop";
   $("dot").className = "dot live"; $("mState").textContent = "monitoring";
   $("runNote").className = "note"; $("runNote").textContent = "";
@@ -482,6 +619,7 @@ async function startRun() {
 function stopRun() {
   running = false;
   cancelAnimationFrame(rafId);
+  updateStart();
   wakeLock?.release?.().catch(() => {}); wakeLock = null;
   if (source === "file") vid.pause();
   $("start").textContent = "Start"; $("start").className = "go";
