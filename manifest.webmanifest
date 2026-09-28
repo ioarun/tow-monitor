@@ -1,0 +1,10 @@
+{
+  "name": "Tow Monitor",
+  "short_name": "Tow",
+  "start_url": "./",
+  "display": "standalone",
+  "orientation": "landscape",
+  "background_color": "#0d1316",
+  "theme_color": "#0d1316",
+  "description": "Watches a tow bobbin and warns before it runs out."
+}

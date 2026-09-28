@@ -1,0 +1,611 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#0d1316">
+<link rel="manifest" href="manifest.webmanifest">
+<title>Tow Monitor</title>
+<style>
+  :root {
+    --bg:#0d1316; --panel:#141c20; --rule:#2a363c; --ink:#e4ebee; --soft:#a2b0b7;
+    --cyan:#3fc4d8; --red:#e8746c; --green:#4ec97a; --amber:#e0a458;
+    --top:env(safe-area-inset-top,0px); --bot:env(safe-area-inset-bottom,0px);
+    --left:env(safe-area-inset-left,0px); --right:env(safe-area-inset-right,0px);
+  }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html,body { height:100%; }
+  body {
+    margin:0; background:var(--bg); color:var(--ink); overflow:hidden;
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;
+    font-size:14px; padding:var(--top) var(--right) var(--bot) var(--left);
+    display:flex; flex-direction:column;
+  }
+  header { display:flex; align-items:center; gap:10px; padding:8px 14px;
+           border-bottom:1px solid var(--rule); flex:none; }
+  h1 { font-size:14px; font-weight:600; margin:0; }
+  .dot { width:8px; height:8px; border-radius:50%; background:var(--soft); flex:none; }
+  .dot.live { background:var(--green); } .dot.warn { background:var(--amber); }
+  .dot.bad { background:var(--red); }
+  .spacer { flex:1; }
+  .chip { font-size:11px; padding:3px 8px; border-radius:999px; border:1px solid var(--rule);
+          color:var(--soft); white-space:nowrap; }
+  .chip.ok { color:var(--green); border-color:#2c5f42; }
+  .chip.bad { color:var(--red); border-color:#5f2f2c; }
+
+  /* Landscape is the committed orientation, so the preview and the panel sit
+     side by side and the panel gets a fixed, readable column. Portrait still
+     works -- it just stacks. */
+  main { flex:1; display:flex; min-height:0; }
+  @media (orientation:portrait) { main { flex-direction:column; } }
+  .stage { flex:1; position:relative; background:#000; display:flex;
+           align-items:center; justify-content:center; min-width:0; min-height:0; }
+  .wrap { position:relative; line-height:0; max-width:100%; max-height:100%; }
+  video, canvas.ov { max-width:100%; max-height:100%; display:block; }
+  video { object-fit:contain; }
+  canvas.ov { position:absolute; inset:0; width:100%; height:100%; pointer-events:none; }
+  .empty { color:var(--soft); font-size:13px; padding:24px; text-align:center; line-height:1.6; }
+
+  aside { width:320px; flex:none; background:var(--panel); border-left:1px solid var(--rule);
+          overflow-y:auto; -webkit-overflow-scrolling:touch; padding:14px; }
+  @media (orientation:portrait) { aside { width:auto; border-left:none;
+          border-top:1px solid var(--rule); max-height:46vh; } }
+
+  .pct { font-size:44px; font-weight:650; font-variant-numeric:tabular-nums;
+         letter-spacing:-.03em; line-height:1; }
+  .lbl { font-size:11px; text-transform:uppercase; letter-spacing:.11em; color:var(--soft); }
+  .bar { height:9px; border-radius:5px; background:#223036; overflow:hidden; margin:10px 0 4px; }
+  .bar > i { display:block; height:100%; width:0; background:var(--cyan); transition:width .25s; }
+  .bar > i.hot { background:var(--red); }
+  .meta { font-size:11px; color:var(--soft); display:flex; gap:12px; flex-wrap:wrap;
+          font-variant-numeric:tabular-nums; }
+
+  section { margin-top:16px; padding-top:14px; border-top:1px solid var(--rule); }
+  section > .lbl { display:block; margin-bottom:8px; }
+  .row { display:flex; gap:8px; align-items:center; }
+  .row + .row { margin-top:8px; }
+  button, .filebtn {
+    font:inherit; font-size:13px; font-weight:500; padding:10px 12px; border-radius:8px;
+    background:#1b262b; color:var(--ink); border:1px solid var(--rule); cursor:pointer;
+    flex:1; text-align:center; white-space:nowrap;
+  }
+  button.go { background:var(--cyan); color:#06232a; border-color:var(--cyan); }
+  button.stop { background:var(--red); color:#2a0d0b; border-color:var(--red); }
+  button:disabled { opacity:.4; }
+  button.seg { flex:1; }
+  button.seg.on { background:#22333a; border-color:var(--cyan); color:var(--cyan); }
+  input[type=text], input[type=number] {
+    font:inherit; font-size:13px; padding:9px 10px; border-radius:8px; flex:1; min-width:0;
+    background:#0f171b; color:var(--ink); border:1px solid var(--rule);
+  }
+  input:focus { outline:none; border-color:var(--cyan); }
+  .note { font-size:11.5px; color:var(--soft); line-height:1.5; margin:8px 0 0; }
+  .note.ok { color:var(--green); } .note.bad { color:var(--red); } .note.warn { color:var(--amber); }
+  .hidden { display:none !important; }
+
+  /* The alert takes the whole screen. An iPad propped by a machine is read
+     from across the room, so the signal is the field of colour. */
+  #alert { position:fixed; inset:0; z-index:50; background:#7d1a14; color:#fff;
+           display:flex; flex-direction:column; align-items:center; justify-content:center;
+           gap:14px; padding:24px; text-align:center; }
+  #alert.flash { background:#e8746c; }
+  #alert h2 { font-size:clamp(32px,7vw,64px); margin:0; letter-spacing:-.02em; }
+  #alert p { margin:0; font-size:16px; max-width:34ch; line-height:1.5; }
+  #alert button { flex:none; background:#fff; color:#7d1a14; border-color:#fff;
+                  font-size:17px; font-weight:600; padding:16px 28px; }
+</style>
+</head>
+<body>
+
+<header>
+  <span class="dot" id="dot"></span>
+  <h1>Tow Monitor</h1>
+  <span class="spacer"></span>
+  <span class="chip" id="calChip">not calibrated</span>
+  <span class="chip" id="netChip">ntfy off</span>
+</header>
+
+<main>
+  <div class="stage">
+    <div class="wrap" id="wrap">
+      <video id="vid" playsinline muted></video>
+      <canvas class="ov" id="ov"></canvas>
+    </div>
+    <div class="empty" id="empty">
+      Calibrate from a recorded depletion, then choose a source.
+    </div>
+  </div>
+
+  <aside>
+    <div class="lbl">core exposed</div>
+    <div class="pct" id="pct">—</div>
+    <div class="bar"><i id="fill"></i></div>
+    <div class="meta">
+      <span id="mState">idle</span>
+      <span id="mThr">—</span>
+      <span id="mDrift"></span>
+    </div>
+
+    <section>
+      <span class="lbl">1 · Calibrate</span>
+      <p class="note">Record one full depletion at the start of the session, then pick it
+        here. The first and last frames are all it needs.</p>
+      <div class="row">
+        <input type="file" id="calFile" accept="video/*" class="hidden">
+        <button onclick="calFile.click()">Pick depletion video</button>
+      </div>
+      <p class="note" id="calNote"></p>
+    </section>
+
+    <section>
+      <span class="lbl">2 · Source</span>
+      <div class="row">
+        <button class="seg" id="srcCam">Live camera</button>
+        <button class="seg" id="srcFile">Video file</button>
+      </div>
+      <input type="file" id="playFile" accept="video/*" class="hidden">
+      <div class="row hidden" id="rateRow">
+        <span class="note" style="margin:0">speed</span>
+        <button id="rateDown">−</button><span id="rateVal" class="note" style="margin:0">1×</span><button id="rateUp">+</button>
+      </div>
+    </section>
+
+    <section>
+      <span class="lbl">3 · Monitor</span>
+      <div class="row">
+        <button class="go" id="start" disabled>Start</button>
+        <button id="reset">Reset</button>
+      </div>
+      <p class="note" id="runNote"></p>
+    </section>
+
+    <section>
+      <span class="lbl">Notification</span>
+      <div class="row">
+        <input type="text" id="topic" placeholder="ntfy topic" autocapitalize="off"
+               autocorrect="off" spellcheck="false">
+      </div>
+      <div class="row">
+        <button id="testNtfy">Send test</button>
+      </div>
+      <p class="note" id="ntfyNote">Needs internet. Turn on the iPhone's Personal Hotspot
+        and join it from this iPad.</p>
+    </section>
+
+    <section>
+      <span class="lbl">Alert threshold</span>
+      <div class="row">
+        <input type="number" id="thr" min="1" max="90" step="1" value="10">
+        <span class="note" style="margin:0">% exposed</span>
+      </div>
+      <p class="note">Fires once per run, after 3 consecutive samples above the threshold.</p>
+    </section>
+  </aside>
+</main>
+
+<div id="alert" class="hidden">
+  <h2>BOBBIN LOW</h2>
+  <p id="alertMsg">Core exposed — get ready to stop the machine.</p>
+  <button id="alertAck">Acknowledge</button>
+</div>
+
+<script src="cv.js"></script>
+<script>
+const $ = id => document.getElementById(id);
+const vid = $("vid"), ov = $("ov"), octx = ov.getContext("2d");
+const grab = document.createElement("canvas");
+const gctx = grab.getContext("2d", { willReadFrequently: true });
+
+const SAMPLE_S = 0.5;        // seconds between samples, in SOURCE time
+const MEDIAN_WINDOW = 5;     // smooth before the clamp, so one spike cannot ratchet
+const CONFIRM = 3;           // consecutive samples over threshold before firing
+const DRIFT_WARN = 14;       // mean abs grey difference that suggests the camera moved
+
+const store = {
+  get(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : JSON.parse(v); }
+              catch { return d; } },
+  set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} },
+};
+
+let cal = store.get("cal", null);
+let refSmall = null;              // grey fingerprint of the calibration frame
+let source = null;                // "cam" | "file"
+let stream = null, running = false, rafId = null, wakeLock = null;
+let lastSampleT = -Infinity, window_ = [], clamped = 0, consecutive = 0;
+let fired = false, audio = null, flashTimer = null;
+
+/* ---- setup restore ---------------------------------------------------- */
+$("topic").value = store.get("topic", "");
+$("thr").value = store.get("thr", 10);
+if (cal && cal.refSmall) refSmall = Float32Array.from(cal.refSmall);
+paintCalChip();
+paintNetChip();
+$("mThr").textContent = "fires at " + $("thr").value + "%";
+
+$("topic").oninput = () => { store.set("topic", $("topic").value.trim()); paintNetChip(); };
+$("thr").oninput = () => {
+  store.set("thr", +$("thr").value || 10);
+  $("mThr").textContent = "fires at " + $("thr").value + "%";
+};
+
+function paintCalChip() {
+  const c = $("calChip");
+  if (!cal) { c.textContent = "not calibrated"; c.className = "chip bad"; return; }
+  c.textContent = `calibrated ${cal.baselinePct}% → ${cal.ceilingPct}%`;
+  c.className = "chip ok";
+}
+function paintNetChip() {
+  const t = $("topic").value.trim();
+  $("netChip").textContent = t ? "ntfy " + t.slice(0, 12) : "ntfy off";
+  $("netChip").className = "chip" + (t ? "" : " bad");
+}
+
+/* ---- frame grabbing ---------------------------------------------------
+   Everything measures off one offscreen canvas, capped by CV.fitInto so a 4K
+   camera costs the same as a 720p one. Calibration goes through the same cap:
+   the two must agree, or the ROI covers a different number of pixels than it
+   was fitted for and every percentage shifts with it. */
+function analyseFrom(el) {
+  const w = el.videoWidth, h = el.videoHeight;
+  if (!w || !h) return null;
+  const [aw, ah] = CV.fitInto(w, h);
+  if (grab.width !== aw || grab.height !== ah) { grab.width = aw; grab.height = ah; }
+  gctx.drawImage(el, 0, 0, aw, ah);
+  return gctx.getImageData(0, 0, aw, ah);
+}
+const frameData = () => analyseFrom(vid);
+
+function seekTo(video, t) {
+  return new Promise((res, rej) => {
+    const done = () => { video.removeEventListener("seeked", done); res(); };
+    video.addEventListener("seeked", done);
+    setTimeout(() => rej(new Error("timed out seeking to " + t.toFixed(1) + "s")), 8000);
+    video.currentTime = t;
+  });
+}
+
+/* iOS will not decode a frame until the element has actually loaded data, and
+   a bare `src` assignment is not enough to guarantee that. */
+function loadVideo(video, url) {
+  return new Promise((res, rej) => {
+    const ok = () => { cleanup(); res(); };
+    const bad = () => { cleanup(); rej(new Error("could not read that video")); };
+    const cleanup = () => {
+      video.removeEventListener("loadeddata", ok);
+      video.removeEventListener("error", bad);
+    };
+    video.addEventListener("loadeddata", ok);
+    video.addEventListener("error", bad);
+    video.src = url;
+    video.load();
+  });
+}
+
+/* ---- calibration ------------------------------------------------------ */
+$("calFile").onchange = async e => {
+  const file = e.target.files[0];
+  if (!file) return;
+  const note = $("calNote");
+  note.className = "note"; note.textContent = "reading video…";
+  stopRun();
+  const url = URL.createObjectURL(file);
+  const probe = document.createElement("video");
+  probe.playsInline = true; probe.muted = true; probe.preload = "auto";
+  try {
+    await loadVideo(probe, url);
+    const dur = probe.duration;
+    if (!isFinite(dur) || dur < 2) throw new Error("that clip is too short to calibrate from");
+
+    const shot = async t => { await seekTo(probe, t); return analyseFrom(probe); };
+    // Not `duration` itself: seeking to the exact end lands past the last
+    // decodable frame on iOS and returns a blank or the poster.
+    const wound = await shot(0);
+    const bare = await shot(Math.max(0, dur - 0.2));
+
+    note.textContent = "fitting…";
+    const fresh = CV.calibrate(wound, bare);
+    fresh.refSmall = Array.from(CV.downsampleGray(wound, 32, 18));
+    cal = fresh; refSmall = Float32Array.from(fresh.refSmall);
+    store.set("cal", fresh);
+    paintCalChip();
+    note.className = "note ok";
+    note.textContent = `Fitted on ${wound.width}×${wound.height}` +
+      (probe.videoWidth > wound.width ? ` (from ${probe.videoWidth}×${probe.videoHeight})` : "") +
+      `. Reads ` +
+      `${fresh.baselinePct}% on a full bobbin and ${fresh.ceilingPct}% when bare — ` +
+      `a ${(fresh.ceilingPct - fresh.baselinePct).toFixed(0)} point span.`;
+    updateStart();
+  } catch (err) {
+    note.className = "note bad";
+    note.textContent = err.message;
+  } finally {
+    URL.revokeObjectURL(url);
+    e.target.value = "";
+  }
+};
+
+/* ---- sources ---------------------------------------------------------- */
+function showStage(on) { $("empty").classList.toggle("hidden", on); $("wrap").style.display = on ? "" : "none"; }
+showStage(false);
+
+$("srcCam").onclick = async () => {
+  stopRun(); releaseFile();
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: "environment", width: { ideal: 1920 }, height: { ideal: 1080 } },
+      audio: false,
+    });
+  } catch (err) {
+    $("runNote").className = "note bad";
+    $("runNote").textContent = "camera unavailable: " + (err.name || err.message) +
+      (location.protocol === "https:" ? "" : " — this page must be served over HTTPS");
+    return;
+  }
+  vid.srcObject = stream; vid.removeAttribute("src");
+  vid.controls = false; await vid.play();
+  source = "cam"; segment("srcCam"); $("rateRow").classList.add("hidden");
+  showStage(true); sizeOverlay(); updateStart();
+};
+
+$("srcFile").onclick = () => $("playFile").click();
+$("playFile").onchange = async e => {
+  const file = e.target.files[0];
+  if (!file) return;
+  stopRun(); stopCamera();
+  const url = URL.createObjectURL(file);
+  vid.srcObject = null;
+  try { await loadVideo(vid, url); } catch (err) {
+    $("runNote").className = "note bad"; $("runNote").textContent = err.message; return;
+  }
+  vid.controls = true; vid.playbackRate = rate;
+  source = "file"; segment("srcFile"); $("rateRow").classList.remove("hidden");
+  showStage(true); sizeOverlay(); updateStart();
+  e.target.value = "";
+};
+
+function segment(onId) {
+  ["srcCam", "srcFile"].forEach(id => $(id).classList.toggle("on", id === onId));
+}
+function stopCamera() { if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; } }
+function releaseFile() { if (vid.src) { vid.pause(); vid.removeAttribute("src"); vid.load(); } }
+
+let rate = 1;
+$("rateUp").onclick = () => setRate(Math.min(8, rate * 2));
+$("rateDown").onclick = () => setRate(Math.max(1, rate / 2));
+function setRate(r) { rate = r; vid.playbackRate = r; $("rateVal").textContent = r + "×"; }
+
+function updateStart() {
+  $("start").disabled = !(cal && source);
+  checkAspect();
+}
+
+/* Compares the live source against the calibration and says so in the panel.
+   Does not block starting -- there are reasons to look at a mismatched source
+   -- but it will not let the mismatch go unmentioned. */
+function checkAspect() {
+  const n = $("runNote");
+  if (!cal || !source || !vid.videoWidth) return null;
+  const [aw, ah] = CV.fitInto(vid.videoWidth, vid.videoHeight);
+  const msg = CV.aspectMismatch(cal, aw, ah);
+  if (msg) { n.className = "note bad"; n.textContent = msg; }
+  else if (n.className === "note bad") { n.className = "note"; n.textContent = ""; }
+  return msg;
+}
+vid.addEventListener("loadedmetadata", checkAspect);
+
+/* ---- overlay ----------------------------------------------------------- */
+function sizeOverlay() {
+  const r = vid.getBoundingClientRect();
+  if (!r.width) return;
+  ov.width = Math.round(r.width); ov.height = Math.round(r.height);
+}
+new ResizeObserver(sizeOverlay).observe(vid);
+vid.addEventListener("loadedmetadata", sizeOverlay);
+
+/* Draws the ROI and tints the pixels it counted. The tint is the only way to
+   see WHY a number is what it is -- a bar at 40% with the rectangle sitting off
+   the barrel looks identical to a correct one. */
+function drawOverlay(detail) {
+  octx.clearRect(0, 0, ov.width, ov.height);
+  if (!cal || !detail) return;
+  const sx = ov.width / detail.w, sy = ov.height / detail.h;
+  const r = CV.toRect(cal, detail.w, detail.h);
+  const cs = CV.rectCorners(r);
+  if (detail.warmPts && detail.warmPts.length) {
+    octx.fillStyle = "rgba(63,196,216,0.55)";
+    const s = Math.max(1, Math.round(Math.min(sx, sy) * 2));
+    for (let i = 0; i < detail.warmPts.length; i += 2)
+      octx.fillRect(detail.warmPts[i] * sx, detail.warmPts[i + 1] * sy, s, s);
+  }
+  octx.strokeStyle = detail.pct >= +$("thr").value ? "#e8746c" : "#3fc4d8";
+  octx.lineWidth = 2;
+  octx.beginPath();
+  cs.forEach(([x, y], i) => i ? octx.lineTo(x * sx, y * sy) : octx.moveTo(x * sx, y * sy));
+  octx.closePath(); octx.stroke();
+}
+
+/* Same geometry as CV.measure, but keeping the warm pixel coordinates so the
+   overlay can show them. Subsampled by 2 -- this is for the eye, not the number. */
+function measureDetail(img) {
+  const r = CV.toRect(cal, img.width, img.height);
+  const cs = CV.rectCorners(r);
+  const xs = cs.map(c => c[0]), ys = cs.map(c => c[1]);
+  const x0 = Math.max(0, Math.floor(Math.min(...xs))), x1 = Math.min(img.width - 1, Math.ceil(Math.max(...xs)));
+  const y0 = Math.max(0, Math.floor(Math.min(...ys))), y1 = Math.min(img.height - 1, Math.ceil(Math.max(...ys)));
+  const d = img.data, warmPts = [];
+  let inside = 0, warm = 0;
+  for (let y = y0; y <= y1; y++) {
+    for (let x = x0; x <= x1; x++) {
+      const dx = x - r.p1[0], dy = y - r.p1[1];
+      const t = dx * r.u[0] + dy * r.u[1];
+      if (t < 0 || t > r.L) continue;
+      const s = dx * r.n[0] + dy * r.n[1];
+      if (s < -r.hw || s > r.hw) continue;
+      inside++;
+      const p = (y * img.width + x) * 4;
+      if (d[p] - d[p + 2] > CV.CREAM_WARM) { warm++; if (!(x % 2) && !(y % 2)) warmPts.push(x, y); }
+    }
+  }
+  return { pct: inside ? (100 * warm) / inside : null, w: img.width, h: img.height, warmPts };
+}
+
+/* ---- the run ----------------------------------------------------------- */
+$("start").onclick = () => running ? stopRun() : startRun();
+$("reset").onclick = () => { resetRun(); $("runNote").className = "note"; $("runNote").textContent = "reset"; };
+
+function resetRun() {
+  window_ = []; clamped = 0; consecutive = 0; fired = false; lastSampleT = -Infinity;
+  $("pct").textContent = "—"; $("fill").style.width = "0"; $("fill").className = "";
+  $("mState").textContent = running ? "monitoring" : "idle";
+  octx.clearRect(0, 0, ov.width, ov.height);
+}
+
+async function startRun() {
+  if (!cal || !source) return;
+  if (checkAspect()) return;          // the number would be meaningless; say so instead
+  resetRun();
+  // The first tap of the session is the only chance to unlock audio on iOS,
+  // and it has to happen before anything needs to make a sound.
+  audio = audio || new (window.AudioContext || window.webkitAudioContext)();
+  await audio.resume();
+  try { wakeLock = await navigator.wakeLock?.request("screen"); } catch {}
+  if (source === "file") { vid.playbackRate = rate; await vid.play(); }
+  running = true;
+  $("start").textContent = "Stop"; $("start").className = "stop";
+  $("dot").className = "dot live"; $("mState").textContent = "monitoring";
+  $("runNote").className = "note"; $("runNote").textContent = "";
+  loop();
+}
+
+function stopRun() {
+  running = false;
+  cancelAnimationFrame(rafId);
+  wakeLock?.release?.().catch(() => {}); wakeLock = null;
+  if (source === "file") vid.pause();
+  $("start").textContent = "Start"; $("start").className = "go";
+  $("dot").className = "dot"; $("mState").textContent = "idle";
+}
+
+function sourceTime() {
+  return source === "file" ? vid.currentTime : performance.now() / 1000;
+}
+
+function loop() {
+  if (!running) return;
+  rafId = requestAnimationFrame(loop);
+  const now = sourceTime();
+  // Sample in SOURCE time, so a clip replayed at 4x is scored at the same rate
+  // per video-second as a live run. Otherwise fast-forwarding silently starves
+  // the median window and flatters the result.
+  if (now - lastSampleT < SAMPLE_S) return;
+  lastSampleT = now;
+
+  const img = frameData();
+  if (!img) return;
+  const detail = measureDetail(img);
+  drawOverlay(detail);
+  if (detail.pct === null) return;
+
+  if (refSmall) {
+    const drift = CV.driftCheck(refSmall, img);
+    $("mDrift").textContent = drift > DRIFT_WARN ? `drift ${drift.toFixed(0)} — recalibrate?` : "";
+    $("mDrift").style.color = drift > DRIFT_WARN ? "var(--amber)" : "";
+  }
+
+  window_.push(detail.pct);
+  if (window_.length > MEDIAN_WINDOW) window_.shift();
+  const sorted = [...window_].sort((a, b) => a - b);
+  const smoothed = sorted[sorted.length >> 1];
+  clamped = Math.max(clamped, smoothed);       // depletion is physically monotone
+
+  const thr = +$("thr").value || 10;
+  $("pct").textContent = clamped.toFixed(1) + "%";
+  $("fill").style.width = Math.min(100, clamped) + "%";
+  $("fill").className = clamped >= thr ? "hot" : "";
+
+  consecutive = clamped >= thr ? consecutive + 1 : 0;
+  if (!fired && consecutive >= CONFIRM) { fired = true; fire(clamped); }
+}
+
+/* ---- firing ------------------------------------------------------------ */
+async function fire(pct) {
+  $("mState").textContent = "ALERTED";
+  $("alertMsg").textContent = `Core ${pct.toFixed(0)}% exposed — get ready to stop the machine.`;
+  $("alert").classList.remove("hidden");
+  startAlarm();
+  const sent = await notify(`Core ${pct.toFixed(0)}% exposed — get ready to stop the machine`);
+  $("runNote").className = "note " + (sent === true ? "ok" : "warn");
+  $("runNote").textContent = sent === true
+    ? "Alert sent to your phone."
+    : "Alert NOT sent (" + sent + "). The iPad alarm is your only warning.";
+}
+
+/* One POST, JSON body. ntfy's header form would need custom headers, which
+   turns this into a CORS preflight for no benefit; a JSON body is a simple
+   request and goes straight through. */
+async function notify(message) {
+  const topic = $("topic").value.trim();
+  if (!topic) return "no topic set";
+  try {
+    const res = await fetch("https://ntfy.sh", {
+      method: "POST",
+      body: JSON.stringify({ topic, title: "Bobbin low", message,
+                             priority: 5, tags: ["warning"] }),
+    });
+    return res.ok ? true : "ntfy returned " + res.status;
+  } catch (err) {
+    return "no internet";      // hotspot off, or out of signal in the workshop
+  }
+}
+
+$("testNtfy").onclick = async () => {
+  const n = $("ntfyNote");
+  n.className = "note"; n.textContent = "sending…";
+  const r = await notify("Test — the notification path is working");
+  n.className = "note " + (r === true ? "ok" : "bad");
+  n.textContent = r === true
+    ? "Sent. It should appear on your phone within a second or two."
+    : "Failed: " + r + ". Check the hotspot is on and this iPad has joined it.";
+};
+
+/* ---- alarm ------------------------------------------------------------- */
+function beep(t0, freq, dur) {
+  const o = audio.createOscillator(), g = audio.createGain();
+  o.type = "square"; o.frequency.setValueAtTime(freq, t0);
+  g.gain.setValueAtTime(0.0001, t0);
+  g.gain.exponentialRampToValueAtTime(0.5, t0 + 0.012);
+  g.gain.setValueAtTime(0.5, t0 + dur - 0.02);
+  g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+  o.connect(g).connect(audio.destination);
+  o.start(t0); o.stop(t0 + dur + 0.02);
+}
+let alarmTimer = null;
+function burst() {
+  if (!audio) return;
+  const t = audio.currentTime;
+  [0, 0.26, 0.52].forEach((off, i) => beep(t + off, i % 2 ? 660 : 990, 0.2));
+}
+function startAlarm() {
+  if (alarmTimer) return;
+  burst();
+  alarmTimer = setInterval(burst, 1800);
+  flashTimer = setInterval(() => $("alert").classList.toggle("flash"), 480);
+}
+$("alertAck").onclick = () => {
+  clearInterval(alarmTimer); alarmTimer = null;
+  clearInterval(flashTimer); flashTimer = null;
+  $("alert").classList.add("hidden"); $("alert").classList.remove("flash");
+};
+
+document.addEventListener("visibilitychange", () => {
+  if (running && document.visibilityState === "visible")
+    navigator.wakeLock?.request("screen").then(w => wakeLock = w).catch(() => {});
+});
+
+if ("serviceWorker" in navigator)
+  navigator.serviceWorker.register("sw.js").catch(() => {});
+</script>
+</body>
+</html>
