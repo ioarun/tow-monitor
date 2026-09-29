@@ -180,7 +180,7 @@
       <span class="lbl">Notification</span>
       <div class="row">
         <input type="text" id="topic" placeholder="ntfy topic" autocapitalize="off"
-               autocorrect="off" spellcheck="false">
+               autocorrect="off" spellcheck="false" inputmode="latin">
       </div>
       <div class="row">
         <button id="testNtfy">Send test</button>
@@ -218,6 +218,13 @@ const MEDIAN_WINDOW = 5;     // smooth before the clamp, so one spike cannot rat
 const CONFIRM = 3;           // consecutive samples over threshold before firing
 const DRIFT_WARN = 14;       // mean abs grey difference that suggests the camera moved
 
+/* Prefilled so a fresh device needs no setup. Note what this is: an ntfy
+ * topic is an unauthenticated shared secret, and this page is public, so
+ * anyone who reads the source can both subscribe to these alerts and publish
+ * to them. Unguessable, but not private. Rotate it here if that stops being
+ * an acceptable trade, or move to a topic protected by an ntfy account. */
+const DEFAULT_TOPIC = "498d75d8515d7ea004b7ac86";
+
 const store = {
   get(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : JSON.parse(v); }
               catch { return d; } },
@@ -232,7 +239,7 @@ let lastSampleT = -Infinity, window_ = [], clamped = 0, consecutive = 0;
 let fired = false, audio = null, flashTimer = null;
 
 /* ---- setup restore ---------------------------------------------------- */
-$("topic").value = store.get("topic", "");
+$("topic").value = store.get("topic", null) ?? DEFAULT_TOPIC;
 $("thr").value = store.get("thr", 10);
 if (cal && cal.refSmall) refSmall = Float32Array.from(cal.refSmall);
 paintCalChip();
