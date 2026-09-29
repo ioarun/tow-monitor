@@ -185,6 +185,9 @@
       <div class="row">
         <button id="testNtfy">Send test</button>
       </div>
+      <div class="row">
+        <button id="repeatBtn">Repeat until acknowledged</button>
+      </div>
       <p class="note" id="ntfyNote">Needs internet. Turn on the iPhone's Personal Hotspot
         and join it from this iPad.</p>
     </section>
@@ -203,6 +206,7 @@
 <div id="alert" class="hidden">
   <h2>BOBBIN LOW</h2>
   <p id="alertMsg">Core exposed — get ready to stop the machine.</p>
+  <p id="alertSends" style="font-size:13px;opacity:.85"></p>
   <button id="alertAck">Acknowledge</button>
 </div>
 
@@ -225,6 +229,17 @@ const DRIFT_WARN = 14;       // mean abs grey difference that suggests the camer
  * an acceptable trade, or move to a topic protected by an ntfy account. */
 const DEFAULT_TOPIC = "498d75d8515d7ea004b7ac86";
 
+/* Seconds after firing at which to re-send. Front-loaded on purpose: the
+ * alert lands about 25 s before the tube goes bare, so the first minute is
+ * the only part that can still save a re-thread. Everything after that is
+ * about not leaving the machine idle, which is a much cheaper failure.
+ *
+ * It stops when Acknowledge is pressed on the iPad -- which happens when you
+ * reach the machine, so arriving is what silences it. The cap exists because
+ * a run left unattended should eventually stop buzzing rather than keep
+ * going all afternoon. */
+const REPEAT_AT = [0, 15, 35, 60, 120, 180];
+
 const store = {
   get(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : JSON.parse(v); }
               catch { return d; } },
@@ -237,6 +252,8 @@ let source = null;                // "cam" | "file"
 let stream = null, running = false, rafId = null, wakeLock = null;
 let lastSampleT = -Infinity, window_ = [], clamped = 0, consecutive = 0;
 let fired = false, audio = null, flashTimer = null;
+let repeatTimers = [], sendsOk = 0, sendsFail = 0;
+let repeatOn = store.get("repeatOn", true);
 
 /* ---- setup restore ---------------------------------------------------- */
 $("topic").value = store.get("topic", null) ?? DEFAULT_TOPIC;
@@ -555,6 +572,7 @@ $("start").onclick = () => running ? stopRun() : startRun();
 $("reset").onclick = () => { resetRun(); $("runNote").className = "note"; $("runNote").textContent = "reset"; };
 
 function resetRun() {
+  clearRepeats();
   window_ = []; clamped = 0; consecutive = 0; fired = false; lastSampleT = -Infinity;
   $("pct").textContent = "—"; $("fill").style.width = "0"; $("fill").className = "";
   $("mState").textContent = running ? "monitoring" : "idle";
@@ -581,6 +599,7 @@ async function startRun() {
 
 function stopRun() {
   running = false;
+  clearRepeats();
   cancelAnimationFrame(rafId);
   updateStart();
   wakeLock?.release?.().catch(() => {}); wakeLock = null;
@@ -631,28 +650,66 @@ function loop() {
 }
 
 /* ---- firing ------------------------------------------------------------ */
-async function fire(pct) {
+function clearRepeats() { repeatTimers.forEach(clearTimeout); repeatTimers = []; }
+
+function fire(pct) {
   $("mState").textContent = "ALERTED";
   $("alertMsg").textContent = `Core ${pct.toFixed(0)}% exposed — get ready to stop the machine.`;
   $("alert").classList.remove("hidden");
   startAlarm();
-  const sent = await notify(`Core ${pct.toFixed(0)}% exposed — get ready to stop the machine`);
-  $("runNote").className = "note " + (sent === true ? "ok" : "warn");
-  $("runNote").textContent = sent === true
-    ? "Alert sent to your phone."
-    : "Alert NOT sent (" + sent + "). The iPad alarm is your only warning.";
+  clearRepeats();
+  sendsOk = sendsFail = 0;
+  const schedule = repeatOn ? REPEAT_AT : [0];
+  schedule.forEach((at, i) =>
+    repeatTimers.push(setTimeout(() => sendAlert(pct, i + 1, schedule.length, at), at * 1000)));
 }
+
+async function sendAlert(pct, n, total, after) {
+  // A repeat that says how long it has been unanswered is worth more than a
+  // duplicate of the first one: on a locked screen the stack of them reads as
+  // an escalation rather than as the same banner arriving again.
+  const r = await notify(
+    after === 0
+      ? `Core ${pct.toFixed(0)}% exposed — get ready to stop the machine`
+      : `Still unacknowledged after ${after < 60 ? after + "s" : Math.round(after / 60) + " min"}`
+        + ` — core ${pct.toFixed(0)}% exposed`,
+    after === 0 ? "Bobbin low" : `Bobbin low — ${after < 60 ? after + "s" : Math.round(after / 60) + " min"}`);
+  if (r === true) sendsOk++; else sendsFail++;
+
+  const tail = total > 1 ? ` (${n} of ${total})` : "";
+  $("runNote").className = "note " + (sendsOk ? "ok" : "warn");
+  $("runNote").textContent = sendsOk
+    ? `Alert sent to your phone${tail}.` + (sendsFail ? ` ${sendsFail} failed.` : "")
+    : `Alert NOT sent (${r})${tail}. The iPad alarm is your only warning.`;
+  $("alertSends").textContent = sendsOk
+    ? `Notified your phone ${sendsOk}×${sendsFail ? `, ${sendsFail} failed` : ""}` +
+      (n < total ? " — repeating until acknowledged" : "")
+    : `Could not reach your phone (${r})`;
+}
+
+$("repeatBtn").onclick = () => { repeatOn = !repeatOn; store.set("repeatOn", repeatOn); paintRepeat(); };
+function paintRepeat() {
+  $("repeatBtn").textContent = repeatOn
+    ? `Repeating until acknowledged (up to ${REPEAT_AT.length}×)`
+    : "Notifying once only";
+  $("repeatBtn").classList.toggle("seg", true);
+  $("repeatBtn").classList.toggle("on", repeatOn);
+}
+paintRepeat();
 
 /* One POST, JSON body. ntfy's header form would need custom headers, which
    turns this into a CORS preflight for no benefit; a JSON body is a simple
    request and goes straight through. */
-async function notify(message) {
+async function notify(message, title = "Bobbin low") {
   const topic = $("topic").value.trim();
   if (!topic) return "no topic set";
   try {
     const res = await fetch("https://ntfy.sh", {
       method: "POST",
-      body: JSON.stringify({ topic, title: "Bobbin low", message,
+      // priority 5 is what makes ntfy ask iOS for a time-sensitive
+      // interruption level, which is what lets it through Focus -- the phone
+      // still has to grant that per-app in Settings > Notifications > ntfy.
+      body: JSON.stringify({ topic, title, message,
                              priority: 5, tags: ["warning"] }),
     });
     return res.ok ? true : "ntfy returned " + res.status;
@@ -697,7 +754,11 @@ function startAlarm() {
 $("alertAck").onclick = () => {
   clearInterval(alarmTimer); alarmTimer = null;
   clearInterval(flashTimer); flashTimer = null;
+  clearRepeats();                       // you are at the machine; stop buzzing
   $("alert").classList.add("hidden"); $("alert").classList.remove("flash");
+  $("alertSends").textContent = "";
+  if (sendsOk) { $("runNote").className = "note"; 
+                 $("runNote").textContent = `Acknowledged after ${sendsOk} notification${sendsOk > 1 ? "s" : ""}.`; }
 };
 
 document.addEventListener("visibilitychange", () => {
