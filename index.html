@@ -131,6 +131,7 @@
     <div class="meta">
       <span id="mState">idle</span>
       <span id="mThr">—</span>
+      <span id="mMotion"></span>
       <span id="mDrift"></span>
     </div>
 
@@ -174,6 +175,7 @@
         <button id="reset">Reset</button>
       </div>
       <p class="note" id="runNote"></p>
+      <p class="note" id="faultNote"></p>
     </section>
 
     <section>
@@ -250,6 +252,13 @@ const DEFAULT_TOPIC = "498d75d8515d7ea004b7ac86";
 const BURST_EVERY = 2;      // seconds between sends while it still matters
 const BURST_UNTIL = 20;     // ...which is roughly how long the tan takes to spread
 const BACKOFF_AT = [26, 34, 45, 60, 90, 130, 180];
+
+/* A2, the fault stop. Deliberately unhurried: the PRD allows 60 s to notice
+ * and the only cost of a stopped machine is idle time, so this gets three
+ * spaced sends rather than the depletion burst. Matching the urgency of a
+ * 25-second collapse here would teach the operator to discount both. */
+const FAULT_AT = [0, 45, 120];
+const MOTION_WARMUP = 10;   // s before stop detection arms — lets AE settle
 const REPEAT_AT = [
   ...Array.from({ length: Math.floor(BURST_UNTIL / BURST_EVERY) + 1 }, (_, i) => i * BURST_EVERY),
   ...BACKOFF_AT,
@@ -268,6 +277,8 @@ let stream = null, running = false, rafId = null, wakeLock = null;
 let lastSampleT = -Infinity, window_ = [], clamped = 0, consecutive = 0;
 let fired = false, audio = null, flashTimer = null;
 let repeatTimers = [], sendsOk = 0, sendsFail = 0;
+let faultTimers = [], faultFired = false, runStartedAt = 0;
+let prevRoiGray = null, prevGrid = null, quietFor = 0, lastMotion = null;
 let repeatOn = store.get("repeatOn", true);
 
 /* ---- setup restore ---------------------------------------------------- */
@@ -587,7 +598,10 @@ $("start").onclick = () => running ? stopRun() : startRun();
 $("reset").onclick = () => { resetRun(); $("runNote").className = "note"; $("runNote").textContent = "reset"; };
 
 function resetRun() {
-  clearRepeats();
+  clearRepeats(); clearFault();
+  faultFired = false; quietFor = 0; lastMotion = null;
+  prevRoiGray = prevGrid = null;
+  $("faultNote").textContent = ""; $("mMotion").textContent = "";
   window_ = []; clamped = 0; consecutive = 0; fired = false; lastSampleT = -Infinity;
   $("pct").textContent = "—"; $("fill").style.width = "0"; $("fill").className = "";
   $("mState").textContent = running ? "monitoring" : "idle";
@@ -605,6 +619,7 @@ async function startRun() {
   try { wakeLock = await navigator.wakeLock?.request("screen"); } catch {}
   if (source === "file") { vid.playbackRate = rate; await vid.play(); }
   running = true;
+  runStartedAt = performance.now() / 1000;
   updateStart();
   $("start").textContent = "Stop"; $("start").className = "stop";
   $("dot").className = "dot live"; $("mState").textContent = "monitoring";
@@ -614,7 +629,7 @@ async function startRun() {
 
 function stopRun() {
   running = false;
-  clearRepeats();
+  clearRepeats(); clearFault();
   cancelAnimationFrame(rafId);
   updateStart();
   wakeLock?.release?.().catch(() => {}); wakeLock = null;
@@ -643,11 +658,15 @@ function loop() {
   drawOverlay(detail);
   if (detail.pct === null) return;
 
+  const grid = CV.downsampleGray(img, 32, 18);
   if (refSmall) {
-    const drift = CV.driftCheck(refSmall, img);
+    let d = 0;
+    for (let i = 0; i < grid.length; i++) d += Math.abs(grid[i] - refSmall[i]);
+    const drift = d / grid.length;
     $("mDrift").textContent = drift > DRIFT_WARN ? `drift ${drift.toFixed(0)} — recalibrate?` : "";
     $("mDrift").style.color = drift > DRIFT_WARN ? "var(--amber)" : "";
   }
+  checkStopped(img, grid);
 
   window_.push(detail.pct);
   if (window_.length > MEDIAN_WINDOW) window_.shift();
@@ -662,6 +681,62 @@ function loop() {
 
   consecutive = clamped >= thr ? consecutive + 1 : 0;
   if (!fired && consecutive >= CONFIRM) { fired = true; fire(clamped); }
+}
+
+/* ---- has the unwind bobbin stopped turning? ----------------------------
+   The bobbin turning is the only thing in the ROI that changes, so the same
+   region already being measured for depletion doubles as the motion sensor.
+
+   What it must not do is cry wolf. A false fault teaches the operator to
+   discount the notification, and the same channel carries the depletion
+   alert -- so an A2 that nags is a way of disabling A1 without anyone
+   choosing to. Hence a threshold 2.5x below the measured running signal, a
+   ten-second hold, and the suppressions below. */
+function checkStopped(img, grid) {
+  const roi = CV.roiGray(img, cal);
+  const m = CV.netMotion(roi, prevRoiGray, grid, prevGrid);
+  prevRoiGray = roi; prevGrid = grid;
+  if (m === null) return;
+  lastMotion = m;
+
+  quietFor = m < CV.STOP_BELOW ? quietFor + SAMPLE_S : 0;
+  $("mMotion").textContent = `motion ${m.toFixed(1)}` +
+    (quietFor >= SAMPLE_S ? ` · still ${quietFor.toFixed(0)}s` : "");
+  $("mMotion").style.color = quietFor >= SAMPLE_S ? "var(--amber)" : "";
+
+  if (faultFired) return;
+  // A stop right after the depletion alert is the operator doing exactly what
+  // they were told to do. Reporting it as a fault would be the system
+  // alarming at its own success.
+  if (fired) return;
+  if ((performance.now() / 1000) - runStartedAt < MOTION_WARMUP) return;
+  // A paused or finished clip is not a stopped machine.
+  if (source === "file" && (vid.paused || vid.ended)) return;
+
+  if (quietFor >= CV.STOP_HOLD) { faultFired = true; fireFault(); }
+}
+
+function clearFault() { faultTimers.forEach(clearTimeout); faultTimers = []; }
+
+function fireFault() {
+  $("mState").textContent = "STOPPED";
+  $("dot").className = "dot warn";
+  $("faultNote").className = "note warn";
+  $("faultNote").textContent =
+    `Machine appears to have stopped — no movement for ${CV.STOP_HOLD}s. Notifying.`;
+  if (audio) { const t = audio.currentTime; beep(t, 440, 0.18); beep(t + 0.3, 330, 0.28); }
+  clearFault();
+  FAULT_AT.forEach((at, i) => faultTimers.push(setTimeout(async () => {
+    const r = await notify(
+      at === 0
+        ? `The unwind bobbin stopped turning — no movement for ${CV.STOP_HOLD}s`
+        : `Still stopped after ${elapsed(at)} — nobody has been to the machine`,
+      at === 0 ? "Machine stopped" : `Machine stopped — ${elapsed(at)}`);
+    $("faultNote").className = "note " + (r === true ? "warn" : "bad");
+    $("faultNote").textContent = r === true
+      ? `Machine stopped — phone notified (${i + 1} of ${FAULT_AT.length}).`
+      : `Machine stopped — could NOT notify (${r}).`;
+  }, at * 1000)));
 }
 
 /* ---- firing ------------------------------------------------------------ */
@@ -774,7 +849,7 @@ function startAlarm() {
 $("alertAck").onclick = () => {
   clearInterval(alarmTimer); alarmTimer = null;
   clearInterval(flashTimer); flashTimer = null;
-  clearRepeats();                       // you are at the machine; stop buzzing
+  clearRepeats(); clearFault();         // you are at the machine; stop buzzing
   $("alert").classList.add("hidden"); $("alert").classList.remove("flash");
   $("alertSends").textContent = "";
   if (sendsOk) { $("runNote").className = "note"; 

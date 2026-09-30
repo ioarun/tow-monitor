@@ -305,6 +305,68 @@ function driftCheck(refSmall, imageData, gridW = 32, gridH = 18) {
   return sum / s.length;            // mean absolute difference, 0..255
 }
 
+/* --- motion, for detecting that the machine has stopped -----------------
+ * The bobbin turning is the only thing in the ROI that changes, so frame
+ * differencing there measures whether the machine is running.
+ *
+ * Differencing the ROI alone does not work: auto-exposure steps, a knock, a
+ * cloud over a skylight all move every pixel in the frame at once, and read
+ * as motion. The fix is to difference a second region that cannot move and
+ * subtract it. The whole-frame 32x18 grid serves, and needs no per-framing
+ * setup -- the ROI is a few percent of the frame, so the grid is dominated
+ * by things that stay put, which makes it a measure of the common mode.
+ *
+ * Measured on two clips of a running machine (~10 min, 1204 samples at
+ * 2 fps): net motion ran at a median of 2.3-2.75, and the longest stretch
+ * that fell below 1.0 was 5.5 s. So STOP_BELOW sits about 2.5x under the
+ * running signal and STOP_HOLD nearly 3x past the longest quiet patch the
+ * footage produced.
+ *
+ * The hold is set by what a false alarm costs, not by how fast detection
+ * could be. The PRD allows 60 s to notice a stop and says idle time is the
+ * only cost -- while a fault alert that cries wolf gets muted, and it shares
+ * a channel with the depletion alert, so muting it disables that too. Buying
+ * margin with latency is therefore almost free, and 15 s spends a quarter of
+ * the budget to nearly triple the margin. */
+const STOP_BELOW = 1.0;     // net grey levels below which the ROI counts as still
+const STOP_HOLD = 15;       // seconds it must stay there
+
+/* Grey samples inside the ROI's bounding box, subsampled by 2. Not masked to
+ * the rotated rectangle: the bounding box is cheaper, and for a difference
+ * the few corner pixels of background are common-mode anyway. */
+function roiGray(imageData, cal, step = 2) {
+  const { data, width, height } = imageData;
+  const r = toRect(cal, width, height);
+  const cs = rectCorners(r);
+  const x0 = Math.max(0, Math.floor(Math.min(...cs.map(c => c[0]))));
+  const x1 = Math.min(width - 1, Math.ceil(Math.max(...cs.map(c => c[0]))));
+  const y0 = Math.max(0, Math.floor(Math.min(...cs.map(c => c[1]))));
+  const y1 = Math.min(height - 1, Math.ceil(Math.max(...cs.map(c => c[1]))));
+  const out = [];
+  for (let y = y0; y <= y1; y += step)
+    for (let x = x0; x <= x1; x += step) {
+      const p = (y * width + x) * 4;
+      out.push((data[p] * 299 + data[p + 1] * 587 + data[p + 2] * 114) / 1000);
+    }
+  return Float32Array.from(out);
+}
+
+function meanAbsDiff(a, b) {
+  if (!a || !b || a.length !== b.length) return null;
+  let s = 0;
+  for (let i = 0; i < a.length; i++) s += Math.abs(a[i] - b[i]);
+  return s / a.length;
+}
+
+/* Motion of the ROI above and beyond whatever moved the whole frame.
+ * Clamped at zero: a negative result means the frame changed more than the
+ * ROI did, which is a lighting event, not the machine running backwards. */
+function netMotion(roiNow, roiPrev, gridNow, gridPrev) {
+  const a = meanAbsDiff(roiNow, roiPrev), b = meanAbsDiff(gridNow, gridPrev);
+  if (a === null || b === null) return null;
+  return Math.max(0, a - b);
+}
+
 function downsampleGray(imageData, gw, gh) {
   const { data, width, height } = imageData;
   const out = new Float32Array(gw * gh);
@@ -327,10 +389,11 @@ function downsampleGray(imageData, gw, gh) {
 }
 
 const CV = { GAIN_MIN, CREAM_WARM, BAND_FRACTION, BASELINE_MAX, CEILING_MIN,
-             ASPECT_TOLERANCE, ANALYSIS_MAX,
+             ASPECT_TOLERANCE, ANALYSIS_MAX, STOP_BELOW, STOP_HOLD,
              warmth, openBinary, largestComponent, principalAxis, percentile,
              fitInto, aspectMismatch,
-             toRect, rectCorners, measure, calibrate, driftCheck, downsampleGray };
+             toRect, rectCorners, measure, calibrate, driftCheck, downsampleGray,
+             roiGray, meanAbsDiff, netMotion };
 
 if (typeof module !== "undefined" && module.exports) module.exports = CV;
 if (typeof window !== "undefined") window.CV = CV;
