@@ -488,8 +488,36 @@ function driftCheck(refSmall, imageData, gridW = 32, gridH = 18) {
  * a channel with the depletion alert, so muting it disables that too. Buying
  * margin with latency is therefore almost free, and 15 s spends a quarter of
  * the budget to nearly triple the margin. */
-const STOP_BELOW = 1.0;     // net grey levels below which the ROI counts as still
+const STOP_BELOW = 1.0;     // FALLBACK only — see stopThresholdFrom()
 const STOP_HOLD = 15;       // seconds it must stay there
+
+/* The stop threshold cannot be a constant either, for the same reason the
+ * colour thresholds could not be: it is a grey-level difference, so it is a
+ * property of the sensor's noise rather than of the machine.
+ *
+ * Measured on a static scene: the iPad reads a median net motion of 0.00,
+ * while an Android tablet reads 0.69 in one clip and 1.57 in another -- two
+ * recordings of the same stationary rig, minutes apart. At STOP_BELOW = 1.0
+ * the second of those reads as "still moving", so a genuinely stopped machine
+ * would never be reported.
+ *
+ * So learn it instead, from the machine running. Take the median net motion
+ * over the first MOTION_WARMUP seconds of a run and call a fraction of it
+ * "stopped". On the iPad the running median was 2.3-2.75, and the 1.0 that
+ * gave zero false alarms over ten minutes is 0.4 of that -- so the fraction
+ * is set to reproduce the one setting that has been properly validated. */
+const STOP_FRACTION = 0.4;   // of the running level
+const STOP_FLOOR = 0.4;      // never arm below this, whatever was measured
+const RUNNING_MIN = 0.8;     // below this the machine was not running to begin with
+
+/* Running level -> the threshold to call it stopped, or null when the warm-up
+ * saw nothing moving. Null means do not arm: a detector that learned its
+ * baseline from an already-stopped machine would never fire, and would look
+ * exactly like one that was working. */
+function stopThresholdFrom(runningLevel) {
+  if (!(runningLevel > RUNNING_MIN)) return null;
+  return Math.max(STOP_FLOOR, runningLevel * STOP_FRACTION);
+}
 
 /* Grey samples inside the ROI's bounding box, subsampled by 2. Not masked to
  * the rotated rectangle: the bounding box is cheaper, and for a difference
@@ -613,6 +641,7 @@ function downsampleGray(imageData, gw, gh) {
 
 const CV = { GAIN_MIN, CREAM_WARM, BAND_FRACTION, BASELINE_MAX, CEILING_MIN,
              ASPECT_TOLERANCE, ANALYSIS_MAX, STOP_BELOW, STOP_HOLD,
+             STOP_FRACTION, STOP_FLOOR, RUNNING_MIN, stopThresholdFrom,
              GAIN_RANGE, CREAM_RANGE,
              warmth, openBinary, largestComponent, principalAxis, percentile, otsu,
              roiWarmthValues, regionFrom, madSigma, creamThresholdFor,
