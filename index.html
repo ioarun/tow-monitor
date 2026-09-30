@@ -262,11 +262,19 @@ const BURST_EVERY = 2;      // seconds between sends while it still matters
 const BURST_UNTIL = 20;     // ...which is roughly how long the tan takes to spread
 const BACKOFF_AT = [26, 34, 45, 60, 90, 130, 180];
 
-/* A2, the fault stop. Deliberately unhurried: the PRD allows 60 s to notice
- * and the only cost of a stopped machine is idle time, so this gets three
- * spaced sends rather than the depletion burst. Matching the urgency of a
- * 25-second collapse here would teach the operator to discount both. */
-const FAULT_AT = [0, 45, 120];
+/* A stopped machine keeps notifying every FAULT_EVERY seconds until someone
+ * acknowledges it, unlike depletion which backs off. The asymmetry is right:
+ * depletion becomes moot once the tube is bare, so nagging past that point is
+ * noise, while a stopped machine stays stopped and stays worth knowing about.
+ *
+ * Capped anyway. "Until acknowledged" with nobody in the building means all
+ * night, and ntfy.sh rate-limits a free topic at roughly one message per five
+ * seconds sustained -- so this cadence sits on that line and a long stop will
+ * start collecting 429s. Those surface as failed sends rather than vanishing.
+ * FAULT_MAX * FAULT_EVERY is five minutes, which is far longer than it should
+ * take to walk to a machine. */
+const FAULT_EVERY = 5;      // seconds between sends
+const FAULT_MAX = 60;       // ...and no more than this many
 const MOTION_WARMUP = 10;   // s before stop detection arms — lets AE settle
 const REPEAT_AT = [
   ...Array.from({ length: Math.floor(BURST_UNTIL / BURST_EVERY) + 1 }, (_, i) => i * BURST_EVERY),
@@ -299,7 +307,8 @@ let lastSampleT = -Infinity, window_ = [], clamped = 0, consecutive = 0;
 let fired = false, audio = null, flashTimer = null;
 let repeatTimers = [], sendsOk = 0, sendsFail = 0;
 let alertKind = null;              // "low" | "stopped" | null — which screen is up
-let faultTimers = [], faultFired = false, runStartedAt = 0;
+let faultTimers = [], faultTicker = null, faultFired = false, runStartedAt = 0;
+let faultSends = 0, faultOk = 0, faultFail = 0;
 let prevRoiGray = null, prevGrid = null, quietFor = 0, lastMotion = null;
 let warmupMotion = [], stopAt;      // undefined = not decided yet, null = not armed
 let repeatOn = store.get("repeatOn", true);
@@ -850,7 +859,11 @@ function checkStopped(img, grid) {
   if (quietFor >= CV.STOP_HOLD) { faultFired = true; fireFault(); }
 }
 
-function clearFault() { faultTimers.forEach(clearTimeout); faultTimers = []; }
+function clearFault() {
+  faultTimers.forEach(clearTimeout);
+  faultTimers = [];
+  clearInterval(faultTicker); faultTicker = null;
+}
 
 function fireFault() {
   $("mState").textContent = "STOPPED";
@@ -865,17 +878,36 @@ function fireFault() {
   showAlertScreen("stopped", "MACHINE STOPPED",
     `The unwind bobbin has not moved for ${CV.STOP_HOLD}s — go and look.`);
   clearFault();
-  FAULT_AT.forEach((at, i) => faultTimers.push(setTimeout(async () => {
+  faultSends = faultOk = faultFail = 0;
+  const since = Date.now();
+  const send = async () => {
+    if (faultSends >= FAULT_MAX) {
+      clearInterval(faultTicker); faultTicker = null;
+      $("faultNote").className = "note bad";
+      $("faultNote").textContent =
+        `Machine stopped — stopped notifying after ${FAULT_MAX} attempts ` +
+        `(${elapsed(FAULT_MAX * FAULT_EVERY)}). Still not acknowledged.`;
+      return;
+    }
+    faultSends++;
+    const ago = Math.round((Date.now() - since) / 1000);
     const r = await notify(
-      at === 0
+      ago < FAULT_EVERY
         ? `The unwind bobbin stopped turning — no movement for ${CV.STOP_HOLD}s`
-        : `Still stopped after ${elapsed(at)} — nobody has been to the machine`,
-      at === 0 ? "Machine stopped" : `Machine stopped — ${elapsed(at)}`);
-    $("faultNote").className = "note " + (r === true ? "warn" : "bad");
-    $("faultNote").textContent = r === true
-      ? `Machine stopped — phone notified (${i + 1} of ${FAULT_AT.length}).`
+        : `Still stopped after ${elapsed(ago)} — nobody has been to the machine`,
+      ago < FAULT_EVERY ? "Machine stopped" : `Machine stopped — ${elapsed(ago)}`);
+    if (r === true) faultOk++; else faultFail++;
+    $("faultNote").className = "note " + (faultOk ? "warn" : "bad");
+    $("faultNote").textContent = faultOk
+      ? `Machine stopped — notified ${faultOk}×` +
+        (faultFail ? `, ${faultFail} failed` : "") + `, repeating until acknowledged.`
       : `Machine stopped — could NOT notify (${r}).`;
-  }, at * 1000)));
+    $("alertSends").textContent = faultOk
+      ? `Notified your phone ${faultOk}×${faultFail ? `, ${faultFail} failed` : ""}`
+      : `Could not reach your phone (${r})`;
+  };
+  send();
+  faultTicker = setInterval(send, FAULT_EVERY * 1000);
 }
 
 /* ---- firing ------------------------------------------------------------ */
