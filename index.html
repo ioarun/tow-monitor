@@ -177,9 +177,12 @@
       </div>
       <p class="note" id="runNote"></p>
       <div class="row">
-        <button id="faultBtn">Also watch for the machine stopping</button>
+        <button id="faultBtn">Stop detection</button>
       </div>
       <p class="note" id="faultNote"></p>
+      <div class="row hidden" id="faultAckRow">
+        <button id="faultAck">Acknowledge stop</button>
+      </div>
     </section>
 
     <section>
@@ -644,6 +647,7 @@ function resetRun() {
   faultFired = false; quietFor = 0; lastMotion = null;
   prevRoiGray = prevGrid = null;
   warmupMotion = []; stopAt = undefined;
+  $("faultAckRow").classList.add("hidden");
   $("faultNote").textContent = ""; $("mMotion").textContent = "";
   window_ = []; clamped = 0; consecutive = 0; fired = false; lastSampleT = -Infinity;
   $("pct").textContent = "—"; $("fill").style.width = "0"; $("fill").className = "";
@@ -851,7 +855,11 @@ function fireFault() {
   $("faultNote").className = "note warn";
   $("faultNote").textContent =
     `Machine appears to have stopped — no movement for ${CV.STOP_HOLD}s. Notifying.`;
+  /* Two beeps, not the depletion alarm. A stop costs idle time and nothing
+     else, so it gets a sound you can tell apart from the one that means walk
+     to the machine now. */
   if (audio) { const t = audio.currentTime; beep(t, 440, 0.18); beep(t + 0.3, 330, 0.28); }
+  $("faultAckRow").classList.remove("hidden");
   clearFault();
   FAULT_AT.forEach((at, i) => faultTimers.push(setTimeout(async () => {
     const r = await notify(
@@ -915,12 +923,14 @@ $("faultBtn").onclick = () => {
   faultOn = !faultOn;
   store.set("faultOn", faultOn);
   paintFault();
-  if (!faultOn) { clearFault(); $("faultNote").textContent = ""; $("mMotion").textContent = ""; }
+  if (!faultOn) {
+    clearFault(); faultFired = false;
+    $("faultNote").textContent = ""; $("mMotion").textContent = "";
+    $("faultAckRow").classList.add("hidden");
+  }
 };
 function paintFault() {
-  $("faultBtn").textContent = faultOn
-    ? "Watching for the machine stopping"
-    : "Also watch for the machine stopping";
+  $("faultBtn").textContent = faultOn ? "Stop detection: on" : "Stop detection: off";
   $("faultBtn").classList.toggle("seg", true);
   $("faultBtn").classList.toggle("on", faultOn);
 }
@@ -988,6 +998,19 @@ function startAlarm() {
   alarmTimer = setInterval(burst, 1800);
   flashTimer = setInterval(() => $("alert").classList.toggle("flash"), 480);
 }
+/* Acknowledging a stop cancels the sends still queued, the same way the
+   depletion acknowledge does. Without it the only ways to stop them were Stop
+   and Reset, both of which end the run -- so a stop you had already dealt
+   with kept notifying, or cost you the run to silence. */
+$("faultAck").onclick = () => {
+  clearFault();
+  $("faultAckRow").classList.add("hidden");
+  $("faultNote").className = "note";
+  $("faultNote").textContent = "Stop acknowledged — no further notifications for it.";
+  $("dot").className = running ? "dot live" : "dot";
+  $("mState").textContent = running ? "monitoring" : "idle";
+};
+
 $("alertAck").onclick = () => {
   clearInterval(alarmTimer); alarmTimer = null;
   clearInterval(flashTimer); flashTimer = null;
