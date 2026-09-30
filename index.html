@@ -229,16 +229,31 @@ const DRIFT_WARN = 14;       // mean abs grey difference that suggests the camer
  * an acceptable trade, or move to a topic protected by an ntfy account. */
 const DEFAULT_TOPIC = "498d75d8515d7ea004b7ac86";
 
-/* Seconds after firing at which to re-send. Front-loaded on purpose: the
- * alert lands about 25 s before the tube goes bare, so the first minute is
- * the only part that can still save a re-thread. Everything after that is
- * about not leaving the machine idle, which is a much cheaper failure.
+/* When to re-send, in seconds after firing.
  *
- * It stops when Acknowledge is pressed on the iPad -- which happens when you
- * reach the machine, so arriving is what silences it. The cap exists because
- * a run left unattended should eventually stop buzzing rather than keep
- * going all afternoon. */
-const REPEAT_AT = [0, 15, 35, 60, 120, 180];
+ * Depletion is quick: the tube goes bare about 25 s after the alert, so that
+ * window is the only part that can still save a re-thread. It gets a send
+ * every BURST_EVERY seconds. After it, urgency drops sharply -- the cost is
+ * now an idle machine rather than a re-thread -- so the schedule backs off
+ * rather than keeping the same pace.
+ *
+ * It stops when Acknowledge is pressed on the iPad, which happens when you
+ * reach the machine, so arriving is what silences it. The tail exists so a
+ * run left unattended eventually stops buzzing instead of going all
+ * afternoon.
+ *
+ * Two ceilings worth knowing before shortening BURST_EVERY further. ntfy.sh
+ * rate-limits a free topic, and a 429 is reported as a failed send rather
+ * than silently dropped. And iOS coalesces repeated alert sounds from one
+ * app, so past a certain density you get more banners but not more noise --
+ * the thing you are actually trying to buy. */
+const BURST_EVERY = 2;      // seconds between sends while it still matters
+const BURST_UNTIL = 20;     // ...which is roughly how long the tan takes to spread
+const BACKOFF_AT = [26, 34, 45, 60, 90, 130, 180];
+const REPEAT_AT = [
+  ...Array.from({ length: Math.floor(BURST_UNTIL / BURST_EVERY) + 1 }, (_, i) => i * BURST_EVERY),
+  ...BACKOFF_AT,
+];
 
 const store = {
   get(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : JSON.parse(v); }
@@ -661,19 +676,24 @@ function fire(pct) {
   sendsOk = sendsFail = 0;
   const schedule = repeatOn ? REPEAT_AT : [0];
   schedule.forEach((at, i) =>
-    repeatTimers.push(setTimeout(() => sendAlert(pct, i + 1, schedule.length, at), at * 1000)));
+    repeatTimers.push(setTimeout(() => sendAlert(n => n, i + 1, schedule.length, at), at * 1000)));
 }
 
-async function sendAlert(pct, n, total, after) {
-  // A repeat that says how long it has been unanswered is worth more than a
-  // duplicate of the first one: on a locked screen the stack of them reads as
-  // an escalation rather than as the same banner arriving again.
+const elapsed = s => (s < 60 ? s + "s" : Math.round(s / 60) + " min");
+
+async function sendAlert(_unused, n, total, after) {
+  // Report the reading as it is NOW, not as it was when the alert fired. The
+  // whole point of a burst during a 25-second collapse is that each banner
+  // says something new: a stack reading 12% ... 40% ... 88% conveys a bobbin
+  // running out. A stack of six identical 12% banners conveys a stuck app,
+  // and a stuck app is one people mute -- which silently disables the alert
+  // they muted it to escape.
+  const now = clamped;
   const r = await notify(
     after === 0
-      ? `Core ${pct.toFixed(0)}% exposed — get ready to stop the machine`
-      : `Still unacknowledged after ${after < 60 ? after + "s" : Math.round(after / 60) + " min"}`
-        + ` — core ${pct.toFixed(0)}% exposed`,
-    after === 0 ? "Bobbin low" : `Bobbin low — ${after < 60 ? after + "s" : Math.round(after / 60) + " min"}`);
+      ? `Core ${now.toFixed(0)}% exposed — get ready to stop the machine`
+      : `Core ${now.toFixed(0)}% exposed · unacknowledged for ${elapsed(after)}`,
+    after === 0 ? "Bobbin low" : `Bobbin low — ${now.toFixed(0)}%`);
   if (r === true) sendsOk++; else sendsFail++;
 
   const tail = total > 1 ? ` (${n} of ${total})` : "";
@@ -690,7 +710,7 @@ async function sendAlert(pct, n, total, after) {
 $("repeatBtn").onclick = () => { repeatOn = !repeatOn; store.set("repeatOn", repeatOn); paintRepeat(); };
 function paintRepeat() {
   $("repeatBtn").textContent = repeatOn
-    ? `Repeating until acknowledged (up to ${REPEAT_AT.length}×)`
+    ? `Every ${BURST_EVERY}s for ${BURST_UNTIL}s, then backing off`
     : "Notifying once only";
   $("repeatBtn").classList.toggle("seg", true);
   $("repeatBtn").classList.toggle("on", repeatOn);
