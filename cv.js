@@ -426,6 +426,7 @@ function calibrate(wound, bare, { verbose = false } = {}) {
    * a hand-tuned constant silently measures the wrong thing on any camera it
    * was not tuned against. Derived per calibration, each device gets its own. */
   cal.creamWarm = creamThresholdFor(wound, cal);
+  cal.creamWarmFit = cal.creamWarm;   // kept: per-run reseeding overwrites creamWarm
 
   const rr = toRect(cal, width, height);
   cal.regionAspect = Math.round((rr.L / (2 * rr.hw)) * 10) / 10;

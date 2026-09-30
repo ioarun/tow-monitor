@@ -201,7 +201,7 @@
     <section>
       <span class="lbl">Alert threshold</span>
       <div class="row">
-        <input type="number" id="thr" min="1" max="90" step="1" value="10">
+        <input type="number" id="thr" min="1" max="90" step="1" value="5">
         <span class="note" style="margin:0">% exposed</span>
       </div>
       <p class="note">Fires once per run, after 3 consecutive samples above the threshold.</p>
@@ -297,15 +297,17 @@ let faultTimers = [], faultFired = false, runStartedAt = 0;
 let prevRoiGray = null, prevGrid = null, quietFor = 0, lastMotion = null;
 let warmupMotion = [], stopAt;      // undefined = not decided yet, null = not armed
 let repeatOn = store.get("repeatOn", true);
-/* Off unless asked for. It shares a notification topic with the depletion
-   alert, so while that is the thing being tested a spurious stop would land
-   as noise on the channel that matters -- and it is still unvalidated on any
-   camera but the iPad. */
-let faultOn = store.get("faultOn", false);
+let faultOn = store.get("faultOn", true);
 
 /* ---- setup restore ---------------------------------------------------- */
 $("topic").value = store.get("topic", null) ?? DEFAULT_TOPIC;
-$("thr").value = store.get("thr", 10);
+/* Was 10%. On both reference clips 5% buys about a second of extra warning --
+   the ramp is steep -- but it also halves the margin over the baseline, which
+   is only safe because the baseline is now reset per bobbin (below). The
+   one-time migration exists because the old value is already in localStorage
+   on devices in the field. */
+if (!store.get("thrV2", false)) { store.set("thr", 5); store.set("thrV2", true); }
+$("thr").value = store.get("thr", 5);
 if (cal && cal.refSmall) refSmall = Float32Array.from(cal.refSmall);
 paintCalChip();
 paintNetChip();
@@ -317,7 +319,7 @@ $("mThr").textContent = "fires at " + $("thr").value + "%";
 
 $("topic").oninput = () => { store.set("topic", $("topic").value.trim()); paintNetChip(); };
 $("thr").oninput = () => {
-  store.set("thr", +$("thr").value || 10);
+  store.set("thr", +$("thr").value || 5);
   $("mThr").textContent = "fires at " + $("thr").value + "%";
 };
 
@@ -649,10 +651,57 @@ function resetRun() {
   octx.clearRect(0, 0, ov.width, ov.height);
 }
 
+/* % the current frame may already read before we refuse to treat it as a full
+   bobbin. Re-deriving the threshold from a tube that is already showing would
+   set it above the tan and the run would never detect anything -- silently,
+   because a baseline of 0% is exactly what success looks like. */
+const RESEED_MAX = 25;
+
+/* Re-derive the cream threshold from the bobbin on the machine right now.
+ *
+ * The geometry and the bare tube do not change between runs -- it is the same
+ * tube, in the same place, seen by a camera that has not moved. What changes
+ * is the bobbin: a different amount of tow, wound to a different thickness,
+ * sitting at a different distance from the fitted region. That is why the
+ * opening reading drifts from run to run when one calibration is reused, and
+ * why refreshing the full-bobbin half of it is enough to pull every run back
+ * to near zero. */
+function reseedBaseline() {
+  const img = frameData();
+  if (!img) return;
+  const before = CV.measure(img, cal);
+  if (before === null) return;
+  if (before > RESEED_MAX) {
+    calMsg(`Baseline NOT reset — this frame already reads ${before.toFixed(0)}% exposed, so ` +
+           `the bobbin is not full. Monitoring with the stored baseline instead.`, "warn");
+    return;
+  }
+  cal.creamWarm = CV.creamThresholdFor(img, cal);
+  cal.baselinePct = Math.round(CV.measure(img, cal) * 100) / 100;
+  cal.refSmall = Array.from(CV.downsampleGray(img, 32, 18));
+  refSmall = Float32Array.from(cal.refSmall);
+  store.set("cal", cal);
+  drawThumb("thumbFull", img);        // the thumbnail should show this bobbin, not the last
+  paintCalChip();
+  /* Show it against the threshold the original two-frame fit produced. A
+     large move is not wrong -- a thicker bobbin or different light genuinely
+     shifts it -- but it is the number that explains a run behaving oddly, and
+     it should not take a code change to see it. */
+  const fit = cal.creamWarmFit;
+  const drifted = fit && (cal.creamWarm > fit * 1.8 || cal.creamWarm < fit / 1.8);
+  calMsg(`Baseline reset for this bobbin: warmth >${cal.creamWarm}` +
+         (fit ? ` (calibration fitted >${fit})` : "") +
+         `, reads ${cal.baselinePct}%. Region and bare-tube reference unchanged.` +
+         (drifted ? " That is a big shift from the fitted value — worth a glance at the tint "
+                  + "once the tube starts showing." : ""),
+         drifted ? "warn" : "ok");
+}
+
 async function startRun() {
   if (!cal || !source) return;
   if (checkAspect()) return;          // the number would be meaningless; say so instead
   resetRun();
+  reseedBaseline();
   // The first tap of the session is the only chance to unlock audio on iOS,
   // and it has to happen before anything needs to make a sound.
   audio = audio || new (window.AudioContext || window.webkitAudioContext)();
@@ -722,7 +771,7 @@ function loop() {
   const smoothed = sorted[sorted.length >> 1];
   clamped = Math.max(clamped, smoothed);       // depletion is physically monotone
 
-  const thr = +$("thr").value || 10;
+  const thr = +$("thr").value || 5;
   $("pct").textContent = clamped.toFixed(1) + "%";
   $("fill").style.width = Math.min(100, clamped) + "%";
   $("fill").className = clamped >= thr ? "hot" : "";
