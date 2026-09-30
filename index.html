@@ -53,8 +53,11 @@
   @media (orientation:portrait) { aside { width:auto; border-left:none;
           border-top:1px solid var(--rule); max-height:46vh; } }
 
-  .pct { font-size:44px; font-weight:650; font-variant-numeric:tabular-nums;
-         letter-spacing:-.03em; line-height:1; }
+  /* The one number read from a distance, so it gets the space. Clamped rather
+     than fixed: the panel is 320px in landscape but full width in portrait,
+     and tabular figures mean "100.0%" occupies the same box as "0.0%". */
+  .pct { font-size:clamp(52px,7.5vw,78px); font-weight:650; font-variant-numeric:tabular-nums;
+         letter-spacing:-.035em; line-height:1; }
   .lbl { font-size:11px; text-transform:uppercase; letter-spacing:.11em; color:var(--soft); }
   .bar { height:9px; border-radius:5px; background:#223036; overflow:hidden; margin:10px 0 4px; }
   .bar > i { display:block; height:100%; width:0; background:var(--cyan); transition:width .25s; }
