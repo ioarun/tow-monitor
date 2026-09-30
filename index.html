@@ -197,8 +197,17 @@
         <button id="testNtfy">Send test</button>
       </div>
       <div class="row">
-        <button id="repeatBtn">Repeat until acknowledged</button>
+        <span class="note" style="margin:0;flex:1">Bobbin low, repeat every</span>
+        <input type="number" id="depEvery" min="2" max="15" step="1" style="max-width:5em">
+        <span class="note" style="margin:0">s</span>
       </div>
+      <p class="note" id="depEveryNote"></p>
+      <div class="row">
+        <span class="note" style="margin:0;flex:1">Machine stopped, every</span>
+        <input type="number" id="stopEvery" min="5" max="60" step="1" style="max-width:5em">
+        <span class="note" style="margin:0">s</span>
+      </div>
+      <p class="note" id="stopEveryNote"></p>
       <p class="note" id="ntfyNote">Needs internet. Turn on the iPhone's Personal Hotspot
         and join it from this iPad.</p>
     </section>
@@ -244,7 +253,7 @@ const DEFAULT_TOPIC = "498d75d8515d7ea004b7ac86";
  *
  * Depletion is quick: the tube goes bare about 25 s after the alert, so that
  * window is the only part that can still save a re-thread. It gets a send
- * every BURST_EVERY seconds. After it, urgency drops sharply -- the cost is
+ * every DEP_EVERY seconds. After it, urgency drops sharply -- the cost is
  * now an idle machine rather than a re-thread -- so the schedule backs off
  * rather than keeping the same pace.
  *
@@ -253,16 +262,24 @@ const DEFAULT_TOPIC = "498d75d8515d7ea004b7ac86";
  * run left unattended eventually stops buzzing instead of going all
  * afternoon.
  *
- * Two ceilings worth knowing before shortening BURST_EVERY further. ntfy.sh
+ * Two ceilings worth knowing, and why DEP_EVERY has a floor at all. ntfy.sh
  * rate-limits a free topic, and a 429 is reported as a failed send rather
  * than silently dropped. And iOS coalesces repeated alert sounds from one
  * app, so past a certain density you get more banners but not more noise --
  * the thing you are actually trying to buy. */
-const BURST_EVERY = 2;      // seconds between sends while it still matters
 const BURST_UNTIL = 20;     // ...which is roughly how long the tan takes to spread
 const BACKOFF_AT = [26, 34, 45, 60, 90, 130, 180];
 
-/* A stopped machine keeps notifying every FAULT_EVERY seconds until someone
+/* The intervals are the operator's to choose; the caps are not. Rather than
+ * police a cap after the fact, the minimum interval IS the densest schedule
+ * validated -- so the cap is structural: turning the dial can only ever make
+ * the app send less, never more, and no combination can exceed what ntfy's
+ * rate limit was checked against. */
+const DEP_EVERY = { min: 2, max: 15, def: 2 };    // depletion, during the burst
+const STOP_EVERY = { min: 5, max: 60, def: 5 };   // stop, until acknowledged
+const STOP_FOR_S = 300;     // ...and no longer than this, whatever the interval
+
+/* A stopped machine keeps notifying every STOP_EVERY seconds until someone
  * acknowledges it, unlike depletion which backs off. The asymmetry is right:
  * depletion becomes moot once the tube is bare, so nagging past that point is
  * noise, while a stopped machine stays stopped and stays worth knowing about.
@@ -271,15 +288,11 @@ const BACKOFF_AT = [26, 34, 45, 60, 90, 130, 180];
  * night, and ntfy.sh rate-limits a free topic at roughly one message per five
  * seconds sustained -- so this cadence sits on that line and a long stop will
  * start collecting 429s. Those surface as failed sends rather than vanishing.
- * FAULT_MAX * FAULT_EVERY is five minutes, which is far longer than it should
- * take to walk to a machine. */
-const FAULT_EVERY = 5;      // seconds between sends
-const FAULT_MAX = 60;       // ...and no more than this many
+ * STOP_FOR_S is five minutes, which is far longer than it should take to
+ * walk to a machine, and holds however the interval is set. */
+
 const MOTION_WARMUP = 10;   // s before stop detection arms — lets AE settle
-const REPEAT_AT = [
-  ...Array.from({ length: Math.floor(BURST_UNTIL / BURST_EVERY) + 1 }, (_, i) => i * BURST_EVERY),
-  ...BACKOFF_AT,
-];
+
 
 const store = {
   get(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : JSON.parse(v); }
@@ -311,7 +324,9 @@ let faultTimers = [], faultTicker = null, faultFired = false, runStartedAt = 0;
 let faultSends = 0, faultOk = 0, faultFail = 0;
 let prevRoiGray = null, prevGrid = null, quietFor = 0, lastMotion = null;
 let warmupMotion = [], stopAt;      // undefined = not decided yet, null = not armed
-let repeatOn = store.get("repeatOn", true);
+const clampNum = (v, r) => Math.max(r.min, Math.min(r.max, v || r.def));
+let depEvery = clampNum(+store.get("depEvery", DEP_EVERY.def), DEP_EVERY);
+let stopEvery = clampNum(+store.get("stopEvery", STOP_EVERY.def), STOP_EVERY);
 let faultOn = store.get("faultOn", true);
 
 /* ---- setup restore ---------------------------------------------------- */
@@ -890,22 +905,23 @@ function fireFault() {
   clearFault();
   faultSends = faultOk = faultFail = 0;
   const since = Date.now();
+  const maxSends = Math.floor(STOP_FOR_S / stopEvery) + 1;
   const send = async () => {
-    if (faultSends >= FAULT_MAX) {
+    if (faultSends >= maxSends) {
       clearInterval(faultTicker); faultTicker = null;
       $("faultNote").className = "note bad";
       $("faultNote").textContent =
-        `Machine stopped — stopped notifying after ${FAULT_MAX} attempts ` +
-        `(${elapsed(FAULT_MAX * FAULT_EVERY)}). Still not acknowledged.`;
+        `Machine stopped — stopped notifying after ${faultSends} attempts ` +
+        `(${elapsed(STOP_FOR_S)}). Still not acknowledged.`;
       return;
     }
     faultSends++;
     const ago = Math.round((Date.now() - since) / 1000);
     const r = await notify(
-      ago < FAULT_EVERY
+      ago < stopEvery
         ? `The unwind bobbin stopped turning — no movement for ${CV.STOP_HOLD}s`
         : `Still stopped after ${elapsed(ago)} — nobody has been to the machine`,
-      ago < FAULT_EVERY ? "Machine stopped" : `Machine stopped — ${elapsed(ago)}`);
+      ago < stopEvery ? "Machine stopped" : `Machine stopped — ${elapsed(ago)}`);
     if (r === true) faultOk++; else faultFail++;
     $("faultNote").className = "note " + (faultOk ? "warn" : "bad");
     $("faultNote").textContent = faultOk
@@ -917,7 +933,7 @@ function fireFault() {
       : `Could not reach your phone (${r})`;
   };
   send();
-  faultTicker = setInterval(send, FAULT_EVERY * 1000);
+  faultTicker = setInterval(send, stopEvery * 1000);
 }
 
 /* ---- firing ------------------------------------------------------------ */
@@ -930,7 +946,7 @@ function fire(pct) {
   startAlarm();
   clearRepeats();
   sendsOk = sendsFail = 0;
-  const schedule = repeatOn ? REPEAT_AT : [0];
+  const schedule = depletionSchedule();
   schedule.forEach((at, i) =>
     repeatTimers.push(setTimeout(() => sendAlert(n => n, i + 1, schedule.length, at), at * 1000)));
 }
@@ -963,7 +979,35 @@ async function sendAlert(_unused, n, total, after) {
     : `Could not reach your phone (${r})`;
 }
 
-$("repeatBtn").onclick = () => { repeatOn = !repeatOn; store.set("repeatOn", repeatOn); paintRepeat(); };
+/* Recomputed per firing rather than stored, so a change takes effect on the
+   next alert without needing a restart. */
+function depletionSchedule() {
+  const burst = [];
+  for (let t = 0; t <= BURST_UNTIL; t += depEvery) burst.push(t);
+  return [...burst, ...BACKOFF_AT];
+}
+
+$("depEvery").oninput = () => {
+  depEvery = clampNum(+$("depEvery").value, DEP_EVERY);
+  store.set("depEvery", depEvery); paintIntervals();
+};
+$("stopEvery").oninput = () => {
+  stopEvery = clampNum(+$("stopEvery").value, STOP_EVERY);
+  store.set("stopEvery", stopEvery); paintIntervals();
+};
+
+function paintIntervals() {
+  $("depEvery").value = depEvery;
+  $("stopEvery").value = stopEvery;
+  const n = depletionSchedule().length;
+  $("depEveryNote").textContent =
+    `${n} alerts — every ${depEvery}s for the first ${BURST_UNTIL}s, then backing off to ` +
+    `${BACKOFF_AT[BACKOFF_AT.length - 1] / 60} min. Stops when acknowledged.`;
+  const m = Math.floor(STOP_FOR_S / stopEvery) + 1;
+  $("stopEveryNote").textContent =
+    `Up to ${m} alerts over ${STOP_FOR_S / 60} min, repeating until acknowledged.`;
+}
+paintIntervals();
 
 $("faultBtn").onclick = () => {
   faultOn = !faultOn;
@@ -976,19 +1020,12 @@ $("faultBtn").onclick = () => {
   }
 };
 function paintFault() {
-  $("faultBtn").textContent = faultOn ? "Stop detection: on" : "Stop detection: off";
+  $("faultBtn").textContent = faultOn ? "Stop detection: ON" : "Stop detection: OFF";
   $("faultBtn").classList.toggle("seg", true);
   $("faultBtn").classList.toggle("on", faultOn);
 }
 paintFault();
-function paintRepeat() {
-  $("repeatBtn").textContent = repeatOn
-    ? `Every ${BURST_EVERY}s for ${BURST_UNTIL}s, then backing off`
-    : "Notifying once only";
-  $("repeatBtn").classList.toggle("seg", true);
-  $("repeatBtn").classList.toggle("on", repeatOn);
-}
-paintRepeat();
+
 
 /* One POST, JSON body. ntfy's header form would need custom headers, which
    turns this into a CORS preflight for no benefit; a JSON body is a simple
