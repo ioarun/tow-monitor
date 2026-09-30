@@ -652,7 +652,17 @@ function measureDetail(img) {
 
 /* ---- the run ----------------------------------------------------------- */
 $("start").onclick = () => running ? stopRun() : startRun();
-$("reset").onclick = () => { resetRun(); $("runNote").className = "note"; $("runNote").textContent = "reset"; };
+/* Reset is the bobbin-swap button: same session, same camera, next bobbin. So
+   it re-derives the baseline exactly as Start does. Hooking the reseed to
+   Start alone left the one path whose entire purpose is "new bobbin" as the
+   one that kept the old bobbin's threshold -- and the only way to get a fresh
+   one was Stop then Start, which is the workflow Reset exists to avoid. */
+$("reset").onclick = () => {
+  resetRun();
+  $("runNote").className = "note";
+  $("runNote").textContent = "reset";
+  if (cal && source) reseedBaseline();
+};
 
 function resetRun() {
   clearRepeats(); clearFault();
