@@ -4,7 +4,7 @@
  * hotspot, and that is there for the alert, not for loading the page. Cache
  * first means the app starts even when the hotspot is off or out of signal.
  */
-const CACHE = "tow-monitor-v13";
+const CACHE = "tow-monitor-v14";
 const SHELL = ["./", "./index.html", "./cv.js", "./manifest.webmanifest"];
 
 self.addEventListener("install", e => {

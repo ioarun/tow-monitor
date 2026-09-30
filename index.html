@@ -93,6 +93,11 @@
 
   /* The alert takes the whole screen. An iPad propped by a machine is read
      from across the room, so the signal is the field of colour. */
+  /* Same screen for both alerts, different colour. A stop reads as amber
+     rather than red because its cost is idle time, and the operator should be
+     able to tell which one they are walking towards from across the room. */
+  #alert.stopped { background:#6e5410; }
+  #alert.stopped button { color:#6e5410; }
   #alert { position:fixed; inset:0; z-index:50; background:#7d1a14; color:#fff;
            display:flex; flex-direction:column; align-items:center; justify-content:center;
            gap:14px; padding:24px; text-align:center; }
@@ -180,9 +185,6 @@
         <button id="faultBtn">Stop detection</button>
       </div>
       <p class="note" id="faultNote"></p>
-      <div class="row hidden" id="faultAckRow">
-        <button id="faultAck">Acknowledge stop</button>
-      </div>
     </section>
 
     <section>
@@ -213,7 +215,7 @@
 </main>
 
 <div id="alert" class="hidden">
-  <h2>BOBBIN LOW</h2>
+  <h2 id="alertTitle">BOBBIN LOW</h2>
   <p id="alertMsg">Core exposed — get ready to stop the machine.</p>
   <p id="alertSends" style="font-size:13px;opacity:.85"></p>
   <button id="alertAck">Acknowledge</button>
@@ -296,6 +298,7 @@ let stream = null, running = false, rafId = null, wakeLock = null;
 let lastSampleT = -Infinity, window_ = [], clamped = 0, consecutive = 0;
 let fired = false, audio = null, flashTimer = null;
 let repeatTimers = [], sendsOk = 0, sendsFail = 0;
+let alertKind = null;              // "low" | "stopped" | null — which screen is up
 let faultTimers = [], faultFired = false, runStartedAt = 0;
 let prevRoiGray = null, prevGrid = null, quietFor = 0, lastMotion = null;
 let warmupMotion = [], stopAt;      // undefined = not decided yet, null = not armed
@@ -647,7 +650,7 @@ function resetRun() {
   faultFired = false; quietFor = 0; lastMotion = null;
   prevRoiGray = prevGrid = null;
   warmupMotion = []; stopAt = undefined;
-  $("faultAckRow").classList.add("hidden");
+  if (alertKind === "stopped") hideAlertScreen();
   $("faultNote").textContent = ""; $("mMotion").textContent = "";
   window_ = []; clamped = 0; consecutive = 0; fired = false; lastSampleT = -Infinity;
   $("pct").textContent = "—"; $("fill").style.width = "0"; $("fill").className = "";
@@ -859,7 +862,8 @@ function fireFault() {
      else, so it gets a sound you can tell apart from the one that means walk
      to the machine now. */
   if (audio) { const t = audio.currentTime; beep(t, 440, 0.18); beep(t + 0.3, 330, 0.28); }
-  $("faultAckRow").classList.remove("hidden");
+  showAlertScreen("stopped", "MACHINE STOPPED",
+    `The unwind bobbin has not moved for ${CV.STOP_HOLD}s — go and look.`);
   clearFault();
   FAULT_AT.forEach((at, i) => faultTimers.push(setTimeout(async () => {
     const r = await notify(
@@ -879,8 +883,8 @@ function clearRepeats() { repeatTimers.forEach(clearTimeout); repeatTimers = [];
 
 function fire(pct) {
   $("mState").textContent = "ALERTED";
-  $("alertMsg").textContent = `Core ${pct.toFixed(0)}% exposed — get ready to stop the machine.`;
-  $("alert").classList.remove("hidden");
+  showAlertScreen("low", "BOBBIN LOW",
+    `Core ${pct.toFixed(0)}% exposed — get ready to stop the machine.`);
   startAlarm();
   clearRepeats();
   sendsOk = sendsFail = 0;
@@ -926,7 +930,7 @@ $("faultBtn").onclick = () => {
   if (!faultOn) {
     clearFault(); faultFired = false;
     $("faultNote").textContent = ""; $("mMotion").textContent = "";
-    $("faultAckRow").classList.add("hidden");
+    if (alertKind === "stopped") hideAlertScreen();
   }
 };
 function paintFault() {
@@ -998,27 +1002,43 @@ function startAlarm() {
   alarmTimer = setInterval(burst, 1800);
   flashTimer = setInterval(() => $("alert").classList.toggle("flash"), 480);
 }
-/* Acknowledging a stop cancels the sends still queued, the same way the
-   depletion acknowledge does. Without it the only ways to stop them were Stop
-   and Reset, both of which end the run -- so a stop you had already dealt
-   with kept notifying, or cost you the run to silence. */
-$("faultAck").onclick = () => {
-  clearFault();
-  $("faultAckRow").classList.add("hidden");
-  $("faultNote").className = "note";
-  $("faultNote").textContent = "Stop acknowledged — no further notifications for it.";
-  $("dot").className = running ? "dot live" : "dot";
-  $("mState").textContent = running ? "monitoring" : "idle";
-};
+function showAlertScreen(kind, title, message) {
+  alertKind = kind;
+  $("alertTitle").textContent = title;
+  $("alertMsg").textContent = message;
+  $("alert").classList.toggle("stopped", kind === "stopped");
+  $("alert").classList.remove("hidden");
+}
 
+function hideAlertScreen() {
+  alertKind = null;
+  $("alert").classList.add("hidden");
+  $("alert").classList.remove("flash", "stopped");
+  $("alertSends").textContent = "";
+}
+
+/* One acknowledge for both. Whichever screen is up, it cancels that alert's
+   queued notifications and leaves the run going -- Stop and Reset would end
+   it, and ending a run also discards the baseline reseeded for the bobbin
+   currently on the machine. */
 $("alertAck").onclick = () => {
   clearInterval(alarmTimer); alarmTimer = null;
   clearInterval(flashTimer); flashTimer = null;
-  clearRepeats(); clearFault();         // you are at the machine; stop buzzing
-  $("alert").classList.add("hidden"); $("alert").classList.remove("flash");
-  $("alertSends").textContent = "";
-  if (sendsOk) { $("runNote").className = "note"; 
-                 $("runNote").textContent = `Acknowledged after ${sendsOk} notification${sendsOk > 1 ? "s" : ""}.`; }
+  const wasStop = alertKind === "stopped";
+  if (wasStop) {
+    clearFault();
+    $("faultNote").className = "note";
+    $("faultNote").textContent = "Stop acknowledged — no further notifications for it.";
+    $("dot").className = running ? "dot live" : "dot";
+    $("mState").textContent = running ? "monitoring" : "idle";
+  } else {
+    clearRepeats();
+    if (sendsOk) {
+      $("runNote").className = "note";
+      $("runNote").textContent = `Acknowledged after ${sendsOk} notification${sendsOk > 1 ? "s" : ""}.`;
+    }
+  }
+  hideAlertScreen();
 };
 
 document.addEventListener("visibilitychange", () => {
