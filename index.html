@@ -501,9 +501,15 @@ function applyCalibration(wound, bare, origin) {
     refSmall = Float32Array.from(fresh.refSmall);
     store.set("cal", fresh);
     paintCalChip();
+    // Show the derived thresholds. On an unfamiliar camera these are the first
+    // numbers worth looking at: they are what the app worked out about this
+    // sensor, and a wildly different pair explains a wildly different result.
     calMsg(`Calibrated from ${origin} at ${wound.width}×${wound.height}. Reads ` +
       `${fresh.baselinePct}% on a full bobbin and ${fresh.ceilingPct}% when bare — ` +
-      `a ${(fresh.ceilingPct - fresh.baselinePct).toFixed(0)} point span.`, "ok");
+      `a ${(fresh.ceilingPct - fresh.baselinePct).toFixed(0)} point span. ` +
+      `This camera: warmth >${fresh.creamWarm}, gain >${fresh.gainAt}, ` +
+      `region ${fresh.regionAspect}:1.` + (fresh.warning ? " " + fresh.warning : ""),
+      fresh.warning ? "warn" : "ok");
     updateStart();
     return true;
   } catch (err) {

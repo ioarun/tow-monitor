@@ -16,14 +16,38 @@
  * what proves these numbers still match the Python they came from.
  */
 
-const GAIN_MIN = 40;        // warmth points a pixel must gain to count as newly bare
-const CREAM_WARM = 45;      // absolute warmth of bare core
+/* Both thresholds below are FALLBACKS. They were hand-tuned on one iPad, and
+ * an absolute R-B value is a property of that camera's sensor and colour
+ * processing, not of carbon tow or cardboard -- which made them the reason the
+ * pipeline could not be trusted on a device it had not been tuned against.
+ *
+ * calibrate() now derives both from the calibration frames by Otsu's method
+ * and stores them, so each camera gets its own. These stay as bounds and as
+ * the answer when a calibration predates the change. */
+const GAIN_MIN = 40;        // fallback: warmth a pixel must gain to count as newly bare
+const CREAM_WARM = 45;      // fallback: absolute warmth of bare core
+const GAIN_RANGE = [15, 70];    // plausible bounds for the derived gain threshold
+const CREAM_RANGE = [15, 95];   // ...and for the derived cream threshold
 const BAND_FRACTION = 0.85; // shrink off the shaded, foreshortened limb of the cylinder
 const OPEN_KERNEL_REF = 21; // at REF_HEIGHT; speckle removal on the gain mask
 const REF_HEIGHT = 3840;
 const MIN_BLOB_FRAC = 0.0024;
 const BASELINE_MAX = 2.0;   // % a full bobbin may read before the fit is suspect
 const CEILING_MIN = 40.0;   // % a bare core must reach for the signal to exist
+const CEILING_GOOD = 95.0;  // % preferred when choosing between candidate regions
+
+/* A cylinder seen side-on is far longer than it is wide, so a well-fitted
+ * region is too. When the second still is captured before the tow has
+ * finished leaving the tube, only part of the barrel has gained warmth and
+ * the region comes out nearly square -- and a near-square point cloud has no
+ * well-determined principal axis, so PCA's answer stops being a measurement.
+ *
+ * Measured: vid1, a run that goes fully bare, fits 465 x 42 px, aspect 11.
+ * vid2, which stops partway, fits 227 x 118 px, aspect 1.9, and its axis
+ * lands 4.7 deg from the barrel's true angle. It still verifies -- the
+ * rectangle is on the barrel -- but it covers 40% of it and the axis is
+ * luck. Worth saying so rather than letting it pass silently. */
+const REGION_ASPECT_MIN = 3.0;
 const ASPECT_TOLERANCE = 0.02;   // 2% — covers rounding, not a real reframing
 
 /* Longest side the analysis runs at. An iPad records at 1080p or 4K, and
@@ -162,6 +186,83 @@ function principalAxis(points) {
   return { mean: [mx, my], u: [ux / len, uy / len] };
 }
 
+/* Otsu's method: the threshold that best splits a distribution into two
+ * groups by maximising the variance between them.
+ *
+ * Kept, but NOT used to choose the cream threshold, and the reason is worth
+ * recording. Otsu assumes two separated modes and finds the valley between
+ * them. Measured inside the ROI on vid1 there is no valley: the tow reaches
+ * 40 at p99 while the tube starts at 19 by p01, so the populations overlap
+ * for twenty points. Otsu cut at 28 -- optimal by its own criterion, and
+ * wrong here, because our costs are not symmetric. Calling some tube "tow"
+ * only lowers the ceiling, which has 98 points to give. Calling some tow
+ * "tube" raises the baseline, which is what every alert threshold is
+ * measured against. It took the baseline from 0.85% to 3.5%. */
+function otsu(values, lo = -255, hi = 255) {
+  const bins = hi - lo + 1;
+  const hist = new Float64Array(bins);
+  let n = 0;
+  for (let i = 0; i < values.length; i++) {
+    const v = Math.round(values[i]);
+    hist[Math.max(lo, Math.min(hi, v)) - lo]++;
+    n++;
+  }
+  if (!n) return 0;
+  let total = 0;
+  for (let i = 0; i < bins; i++) total += i * hist[i];
+
+  const bc = new Float64Array(bins);      // between-class variance per threshold
+  let sumB = 0, wB = 0, best = -1;
+  for (let t = 0; t < bins; t++) {
+    wB += hist[t];
+    sumB += t * hist[t];
+    const wF = n - wB;
+    if (!wB || !wF) continue;             // a split with an empty side is not a split
+    const mB = sumB / wB, mF = (total - sumB) / wF;
+    bc[t] = wB * wF * (mB - mF) * (mB - mF);
+    if (bc[t] > best) best = bc[t];
+  }
+  if (best <= 0) return 0;
+
+  /* Take the middle of the optimum, not its first element. When the two modes
+   * are cleanly separated the valley between them is empty, so every threshold
+   * inside it scores identically -- and returning the first puts the cut hard
+   * against the darker mode, where a little sensor noise carries pixels across
+   * it. The midpoint is the same optimum with margin on both sides. */
+  let loT = bins, hiT = 0;
+  for (let t = 0; t < bins; t++)
+    if (bc[t] >= best * 0.999) { if (t < loT) loT = t; if (t > hiT) hiT = t; }
+  return Math.round((loT + hiT) / 2) + lo;
+}
+
+const clamp = (v, [lo, hi]) => Math.max(lo, Math.min(hi, v));
+
+/* The cream threshold, derived from the frame that must read zero.
+ *
+ * Not from the separation between tow and tube -- from the tow alone. Sit
+ * just above what a full bobbin reads and the baseline is near zero by
+ * construction, on whatever camera is in front of you, which is the property
+ * the whole measurement rests on. Whether the tube clears it is then checked
+ * by CEILING_MIN rather than assumed.
+ *
+ * WOUND_QUANTILE is the fraction of a full bobbin allowed above the
+ * threshold, and it buys baseline with ceiling. Measured on vid1 at the
+ * region the old constants produced:
+ *
+ *   q=0.980  cream>26   1.90% ->  100%
+ *   q=0.990  cream>44   0.92% ->  100%     <- and 45 was the hand-tuned value
+ *   q=0.995  cream>60   0.38% ->   62%
+ *
+ * Past 0.99 the threshold climbs into the tube's own distribution and starts
+ * discarding the signal to chase a baseline that is already negligible
+ * against a 10% alert. */
+const WOUND_QUANTILE = 0.99;
+
+function creamThresholdFor(wound, cal) {
+  const w = roiWarmthValues(wound, cal).sort((a, b) => a - b);
+  return clamp(Math.round(percentile(w, WOUND_QUANTILE)) + 1, CREAM_RANGE);
+}
+
 function percentile(sorted, q) {
   if (!sorted.length) return 0;
   const i = (sorted.length - 1) * q;
@@ -204,6 +305,7 @@ function measure(imageData, cal) {
   const y0 = Math.max(0, Math.floor(Math.min(...cs.map(c => c[1]))));
   const y1 = Math.min(height - 1, Math.ceil(Math.max(...cs.map(c => c[1]))));
   const d = imageData.data;
+  const warmAt = cal.creamWarm ?? CREAM_WARM;   // older calibrations have no derived value
   let inside = 0, warm = 0;
   for (let y = y0; y <= y1; y++) {
     for (let x = x0; x <= x1; x++) {
@@ -214,7 +316,7 @@ function measure(imageData, cal) {
       if (s < -r.hw || s > r.hw) continue;
       inside++;
       const p = (y * width + x) * 4;
-      if (d[p] - d[p + 2] > CREAM_WARM) warm++;
+      if (d[p] - d[p + 2] > warmAt) warm++;
     }
   }
   return inside ? (100 * warm) / inside : null;
@@ -231,58 +333,110 @@ function calibrate(wound, bare, { verbose = false } = {}) {
     throw new Error(`frames differ in size: ${width}x${height} vs ${bare.width}x${bare.height}`);
 
   const a = warmth(wound), b = warmth(bare);
-  const gainMask = new Uint8Array(a.length);
-  for (let i = 0; i < a.length; i++) gainMask[i] = b[i] - a[i] > GAIN_MIN ? 1 : 0;
+  const gain = new Int16Array(a.length);
+  for (let i = 0; i < a.length; i++) gain[i] = b[i] - a[i];
 
-  const opened = openBinary(gainMask, width, height, scaled(OPEN_KERNEL_REF, height, 3, true));
-  const { points, size } = largestComponent(opened, width, height);
+  /* No fixed gain threshold transfers between cameras. A robust noise scale
+   * gets the order of magnitude right but not the value: median + 8 sigma is
+   * 41 on one of our clips and 59 on the other, and only one of those works.
+   *
+   * So do not derive it -- search it. Candidates are spaced in units of this
+   * camera's own noise, and each is judged by the checks the calibration has
+   * to pass anyway. Using the acceptance test as the objective means the
+   * answer is right by the same standard it will later be judged by, on any
+   * camera, rather than right according to a proxy that held on ours.
+   *
+   * The objective is COVERAGE, subject to a clean baseline and a real
+   * ceiling. Scoring on separation instead looks tempting and is a trap: it
+   * picked a 1,880 px patch in the middle of the tube, which reads 0% to
+   * 99.9% and is a perfect score for a region covering almost none of the
+   * barrel. The widest span and the most useful region are not the same
+   * thing, and only one of them measures depletion. */
+  const sigma = madSigma(gain);
+  const candidates = [...new Set([4, 6, 8, 10, 12]
+    .map(k => clamp(Math.round(sigma.median + k * sigma.scale), GAIN_RANGE)))];
+
+  let best = null;
+  for (const gainAt of candidates) {
+    const m = new Uint8Array(a.length);
+    for (let i = 0; i < a.length; i++) m[i] = gain[i] > gainAt ? 1 : 0;
+    let attempt;
+    try {
+      const opened = openBinary(m, width, height, scaled(OPEN_KERNEL_REF, height, 3, true));
+      attempt = largestComponent(opened, width, height);
+    } catch { continue; }                       // nothing found at this threshold
+    if (attempt.size < MIN_BLOB_FRAC * width * height) { best = best || { gainAt, ...attempt, thin: true }; continue; }
+    const trial = regionFrom(attempt.points, width, height);
+    trial.creamWarm = creamThresholdFor(wound, trial);
+    const lo = measure(wound, trial), hi = measure(bare, trial);
+    if (verbose) console.log(`  gain>${gainAt}: ${attempt.size} px, cream>${trial.creamWarm}, ` +
+      `${lo.toFixed(2)}% -> ${hi.toFixed(1)}%`);
+    if (lo > BASELINE_MAX || hi < CEILING_MIN) continue;
+    /* Coverage, but not at the cost of range. Maximising size alone picked a
+     * region 3.4x larger whose ceiling had collapsed to 61%, because it had
+     * spread past the barrel onto surfaces that never turn warm. Prefer every
+     * candidate that keeps a near-full ceiling, and only among those take the
+     * largest; fall back to merely acceptable ones if none qualifies. */
+    const tier = hi >= CEILING_GOOD ? 1 : 0;
+    if (!best || best.thin || tier > best.tier ||
+        (tier === best.tier && attempt.size > best.size))
+      best = { gainAt, ...attempt, trial, lo, hi, tier };
+  }
+  if (!best) best = { gainAt: candidates[0], points: [], size: 0, thin: true };
+  const { gainAt, points, size } = best;
 
   const minBlob = MIN_BLOB_FRAC * width * height;
   if (size < minBlob) {
-    // The usual cause is auto white balance neutralising the warm tube, and the
-    // warmth percentiles say immediately whether that is what happened.
-    const sorted = Array.from(b).sort((x, y) => x - y);
-    const p99 = percentile(sorted, 0.99);
-    throw new Error(
-      `Only ${size.toLocaleString()} px gained warmth, need ${Math.round(minBlob).toLocaleString()}. ` +
-      `Warmth in the end frame reaches ${Math.round(p99)} at p99 (bare core reads above ${CREAM_WARM}). ` +
-      (p99 < CREAM_WARM * 1.5
-        ? "The tube is not reading as warm — most likely the camera's auto white balance. Lock exposure and white balance before recording."
-        : "Some warm pixels exist but too few — is the core actually showing in the last frame?"));
+    /* Say which of three different problems this is. The previous version
+     * blamed auto white balance whenever the frame was not very warm, which
+     * is also true of a frame containing no tube at all -- so it confidently
+     * misdiagnosed the most common setup mistake, and did so on exactly the
+     * unfamiliar device where the operator cannot tell it is wrong. */
+    const warmSorted = Array.from(b).sort((x, y) => x - y);
+    const p99 = percentile(warmSorted, 0.99);
+    const sceneDiff = meanAbsDiff(downsampleGray(bare, 32, 18), downsampleGray(wound, 32, 18));
+    const head = `Only ${size.toLocaleString()} px gained warmth, need ` +
+                 `${Math.round(minBlob).toLocaleString()}. `;
+
+    if (sceneDiff < 2)
+      throw new Error(head + `The two stills are almost identical (scene difference ` +
+        `${sceneDiff.toFixed(1)}). Capture the second one after the core is actually showing — ` +
+        `at the end of a run, or with an empty tube swapped into the same place.`);
+    if (p99 < 25)
+      throw new Error(head + `Nothing in the second still is warm: the warmest 1% of the frame ` +
+        `only reaches ${Math.round(p99)}, where bare cardboard reads well above that. Either the ` +
+        `tube is not in shot, or the camera's auto white balance has neutralised it — check the ` +
+        `thumbnail shows the tube, then lock exposure and white balance.`);
+    throw new Error(head + `The frame does contain warm pixels (p99 ${Math.round(p99)}) but few of ` +
+      `them changed between the two stills. Are both framed on the same bobbin, and does the ` +
+      `second one show bare tube where the first showed tow?`);
   }
 
-  const { mean, u } = principalAxis(points);
-  let tMin = Infinity, tMax = -Infinity;
-  const perp = [];
-  for (let i = 0; i < points.length; i += 2) {
-    const dx = points[i] - mean[0], dy = points[i + 1] - mean[1];
-    const t = dx * u[0] + dy * u[1];
-    if (t < tMin) tMin = t;
-    if (t > tMax) tMax = t;
-    perp.push(Math.abs(dx * -u[1] + dy * u[0]));
-  }
-  perp.sort((x, y) => x - y);
-  const halfWidth = percentile(perp, 0.97) * BAND_FRACTION;
+  const cal = regionFrom(points, width, height);
+  cal.gainPx = size;
+  cal.gainAt = gainAt;
 
-  let p1 = [mean[0] + u[0] * tMin, mean[1] + u[1] * tMin];
-  let p2 = [mean[0] + u[0] * tMax, mean[1] + u[1] * tMax];
+  /* Derive this camera's cream threshold from the two frames, inside the
+   * region just fitted. Those pixels are black tow in one frame and bare tube
+   * in the other -- as cleanly bimodal as this problem ever gets -- so Otsu
+   * lands in the valley between them.
+   *
+   * This is what makes the pipeline portable. An absolute R-B cut is a fact
+   * about one sensor's colour processing, not about carbon and cardboard, so
+   * a hand-tuned constant silently measures the wrong thing on any camera it
+   * was not tuned against. Derived per calibration, each device gets its own. */
+  cal.creamWarm = creamThresholdFor(wound, cal);
 
-  const cal = {
-    p1: [p1[0] / width, p1[1] / height],
-    p2: [p2[0] / width, p2[1] / height],
-    halfWidth: halfWidth / height,
-    aspect: width / height,
-    fittedAt: [width, height],
-    gainPx: size,
-    angleDeg: ((Math.atan2(u[1], u[0]) * 180) / Math.PI + 180) % 180,
-  };
+  const rr = toRect(cal, width, height);
+  cal.regionAspect = Math.round((rr.L / (2 * rr.hw)) * 10) / 10;
 
   // Verify before returning. These bounds do not steer the fit; they reject a
   // calibration that would be useless downstream, with a reason a human can act on.
   const lo = measure(wound, cal), hi = measure(bare, cal);
   cal.baselinePct = Math.round(lo * 100) / 100;
   cal.ceilingPct = Math.round(hi * 10) / 10;
-  if (verbose) console.log(`gain ${size} px, baseline ${lo.toFixed(2)}%, ceiling ${hi.toFixed(1)}%`);
+  if (verbose) console.log(`gain ${size} px @>${gainAt}, cream >${cal.creamWarm}, ` +
+    `baseline ${lo.toFixed(2)}%, ceiling ${hi.toFixed(1)}%`);
 
   if (lo > BASELINE_MAX)
     throw new Error(`The first frame reads ${lo.toFixed(1)}% inside the fitted region, above the ` +
@@ -291,6 +445,12 @@ function calibrate(wound, bare, { verbose = false } = {}) {
   if (hi < CEILING_MIN)
     throw new Error(`The last frame only reads ${hi.toFixed(1)}%, below the ${CEILING_MIN}% needed ` +
       `for a usable signal. Let the recording run until the core is properly showing.`);
+
+  // Usable, but say so: the numbers will be right and the region will be small.
+  if (cal.regionAspect < REGION_ASPECT_MIN)
+    cal.warning = `Only part of the tube was bare in the second still, so the fitted region ` +
+      `is stubby (${cal.regionAspect}:1) and covers less of the barrel than it could. It will ` +
+      `work, but capturing once the whole tube is showing gives a better region.`;
   return cal;
 }
 
@@ -351,6 +511,69 @@ function roiGray(imageData, cal, step = 2) {
   return Float32Array.from(out);
 }
 
+/* A blob of points -> the rotated rectangle covering it, as a calibration.
+ * Called once per candidate threshold during the search and once more for the
+ * winner, so it must stay free of side effects. */
+function regionFrom(points, width, height) {
+  const { mean, u } = principalAxis(points);
+  let tMin = Infinity, tMax = -Infinity;
+  const perp = [];
+  for (let i = 0; i < points.length; i += 2) {
+    const dx = points[i] - mean[0], dy = points[i + 1] - mean[1];
+    const t = dx * u[0] + dy * u[1];
+    if (t < tMin) tMin = t;
+    if (t > tMax) tMax = t;
+    perp.push(Math.abs(dx * -u[1] + dy * u[0]));
+  }
+  perp.sort((x, y) => x - y);
+  const halfWidth = percentile(perp, 0.97) * BAND_FRACTION;
+  const p1 = [mean[0] + u[0] * tMin, mean[1] + u[1] * tMin];
+  const p2 = [mean[0] + u[0] * tMax, mean[1] + u[1] * tMax];
+  return {
+    p1: [p1[0] / width, p1[1] / height],
+    p2: [p2[0] / width, p2[1] / height],
+    halfWidth: halfWidth / height,
+    aspect: width / height,
+    fittedAt: [width, height],
+    angleDeg: ((Math.atan2(u[1], u[0]) * 180) / Math.PI + 180) % 180,
+  };
+}
+
+/* Warmth of every pixel inside the ROI's bounding rectangle. Used to derive
+ * the cream threshold, so it deliberately walks the rotated rectangle rather
+ * than its bounding box: background in the corners would pull the histogram. */
+function roiWarmthValues(imageData, cal, step = 2) {
+  const { data, width, height } = imageData;
+  const r = toRect(cal, width, height);
+  const cs = rectCorners(r);
+  const x0 = Math.max(0, Math.floor(Math.min(...cs.map(c => c[0]))));
+  const x1 = Math.min(width - 1, Math.ceil(Math.max(...cs.map(c => c[0]))));
+  const y0 = Math.max(0, Math.floor(Math.min(...cs.map(c => c[1]))));
+  const y1 = Math.min(height - 1, Math.ceil(Math.max(...cs.map(c => c[1]))));
+  const out = [];
+  for (let y = y0; y <= y1; y += step)
+    for (let x = x0; x <= x1; x += step) {
+      const dx = x - r.p1[0], dy = y - r.p1[1];
+      const t = dx * r.u[0] + dy * r.u[1];
+      if (t < 0 || t > r.L) continue;
+      const sN = dx * r.n[0] + dy * r.n[1];
+      if (sN < -r.hw || sN > r.hw) continue;
+      const p = (y * width + x) * 4;
+      out.push(data[p] - data[p + 2]);
+    }
+  return out;
+}
+
+/* Robust noise scale: most of a gain image is pixels that did not change, so
+ * the median absolute deviation measures the camera rather than the subject.
+ * 1.4826 converts MAD to the standard deviation of an equivalent normal. */
+function madSigma(values) {
+  const v = Array.from(values).sort((x, y) => x - y);
+  const median = v[v.length >> 1];
+  const dev = v.map(x => Math.abs(x - median)).sort((x, y) => x - y);
+  return { median, scale: Math.max(1, dev[dev.length >> 1] * 1.4826) };
+}
+
 function meanAbsDiff(a, b) {
   if (!a || !b || a.length !== b.length) return null;
   let s = 0;
@@ -390,7 +613,9 @@ function downsampleGray(imageData, gw, gh) {
 
 const CV = { GAIN_MIN, CREAM_WARM, BAND_FRACTION, BASELINE_MAX, CEILING_MIN,
              ASPECT_TOLERANCE, ANALYSIS_MAX, STOP_BELOW, STOP_HOLD,
-             warmth, openBinary, largestComponent, principalAxis, percentile,
+             GAIN_RANGE, CREAM_RANGE,
+             warmth, openBinary, largestComponent, principalAxis, percentile, otsu,
+             roiWarmthValues, regionFrom, madSigma, creamThresholdFor,
              fitInto, aspectMismatch,
              toRect, rectCorners, measure, calibrate, driftCheck, downsampleGray,
              roiGray, meanAbsDiff, netMotion };
