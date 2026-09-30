@@ -201,15 +201,14 @@
         <input type="number" id="depEvery" min="2" max="15" step="1" style="max-width:5em">
         <span class="note" style="margin:0">s</span>
       </div>
-      <p class="note" id="depEveryNote"></p>
+
       <div class="row">
         <span class="note" style="margin:0;flex:1">Machine stopped, every</span>
         <input type="number" id="stopEvery" min="5" max="60" step="1" style="max-width:5em">
         <span class="note" style="margin:0">s</span>
       </div>
-      <p class="note" id="stopEveryNote"></p>
-      <p class="note" id="ntfyNote">Needs internet. Turn on the iPhone's Personal Hotspot
-        and join it from this iPad.</p>
+
+      <p class="note" id="ntfyNote"></p>
     </section>
 
     <section>
@@ -999,13 +998,6 @@ $("stopEvery").oninput = () => {
 function paintIntervals() {
   $("depEvery").value = depEvery;
   $("stopEvery").value = stopEvery;
-  const n = depletionSchedule().length;
-  $("depEveryNote").textContent =
-    `${n} alerts — every ${depEvery}s for the first ${BURST_UNTIL}s, then backing off to ` +
-    `${BACKOFF_AT[BACKOFF_AT.length - 1] / 60} min. Stops when acknowledged.`;
-  const m = Math.floor(STOP_FOR_S / stopEvery) + 1;
-  $("stopEveryNote").textContent =
-    `Up to ${m} alerts over ${STOP_FOR_S / 60} min, repeating until acknowledged.`;
 }
 paintIntervals();
 
