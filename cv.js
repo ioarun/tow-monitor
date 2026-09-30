@@ -458,11 +458,32 @@ function calibrate(wound, bare, { verbose = false } = {}) {
  * grayscale over the whole frame, which is enough to catch a knocked tripod.
  * It cannot correct for movement -- saying "recalibrate" is the honest response
  * when the alternative is measuring the wrong rectangle and believing it. */
-function driftCheck(refSmall, imageData, gridW = 32, gridH = 18) {
+function driftCheck(refSmall, imageData, cal, gridW = 32, gridH = 18) {
   const s = downsampleGray(imageData, gridW, gridH);
-  let sum = 0;
-  for (let i = 0; i < s.length; i++) sum += Math.abs(s[i] - refSmall[i]);
-  return sum / s.length;            // mean absolute difference, 0..255
+  /* Skip the cells covering the ROI. The reference is the full-bobbin frame,
+   * so as the tube goes bare that region legitimately stops matching it --
+   * and comparing it anyway made depletion itself look like camera movement,
+   * raising "recalibrate?" at precisely the moment the reading matters. Drift
+   * is about the scene around the barrel, which has no reason to change. */
+  let skip = null;
+  if (cal) {
+    const r = toRect(cal, imageData.width, imageData.height);
+    const cs = rectCorners(r);
+    skip = {
+      x0: Math.floor(Math.min(...cs.map(p => p[0])) / imageData.width * gridW) - 1,
+      x1: Math.ceil(Math.max(...cs.map(p => p[0])) / imageData.width * gridW) + 1,
+      y0: Math.floor(Math.min(...cs.map(p => p[1])) / imageData.height * gridH) - 1,
+      y1: Math.ceil(Math.max(...cs.map(p => p[1])) / imageData.height * gridH) + 1,
+    };
+  }
+  let sum = 0, n = 0;
+  for (let gy = 0; gy < gridH; gy++)
+    for (let gx = 0; gx < gridW; gx++) {
+      if (skip && gx >= skip.x0 && gx <= skip.x1 && gy >= skip.y0 && gy <= skip.y1) continue;
+      const i = gy * gridW + gx;
+      sum += Math.abs(s[i] - refSmall[i]); n++;
+    }
+  return n ? sum / n : 0;           // mean absolute difference, 0..255
 }
 
 /* --- motion, for detecting that the machine has stopped -----------------

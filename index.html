@@ -131,6 +131,7 @@
     <div class="meta">
       <span id="mState">idle</span>
       <span id="mThr">—</span>
+      <span id="mWarm"></span>
       <span id="mMotion"></span>
       <span id="mDrift"></span>
     </div>
@@ -274,6 +275,18 @@ const store = {
 };
 
 let cal = store.get("cal", null);
+/* A calibration saved before the thresholds became per-camera has no
+   creamWarm, so measure() falls back to the constant tuned on one iPad. On a
+   sensor whose warmest pixel is 43 that constant is 45, and every reading is
+   zero forever -- with a green "calibrated" chip above it, because the stored
+   baseline and ceiling were true when they were written. Discard it rather
+   than let it read zero convincingly. */
+let calStale = false;
+if (cal && (cal.creamWarm === undefined || cal.gainAt === undefined)) {
+  calStale = true;
+  cal = null;
+  try { localStorage.removeItem("cal"); } catch {}
+}
 let refSmall = null;              // grey fingerprint of the calibration frame
 let source = null;                // "cam" | "file"
 let stream = null, running = false, rafId = null, wakeLock = null;
@@ -296,6 +309,10 @@ $("thr").value = store.get("thr", 10);
 if (cal && cal.refSmall) refSmall = Float32Array.from(cal.refSmall);
 paintCalChip();
 paintNetChip();
+if (calStale)
+  calMsg("Your saved calibration was made before this app worked out colour thresholds " +
+         "per camera, so it has been discarded — it would have read 0% forever on any " +
+         "device but the original iPad. Please calibrate again.", "warn");
 $("mThr").textContent = "fires at " + $("thr").value + "%";
 
 $("topic").oninput = () => { store.set("topic", $("topic").value.trim()); paintNetChip(); };
@@ -414,9 +431,13 @@ $("srcCam").onclick = async () => {
   vid.controls = false; await vid.play();
   source = "cam"; segment("srcCam"); $("rateRow").classList.add("hidden");
   showStage(true); sizeOverlay(); updateStart();
-  const t = stream.getVideoTracks()[0].getSettings();
-  $("calHint").textContent = `Camera at ${t.width}×${t.height}. Two stills, nothing in ` +
-    `between: a full bobbin, then the bare tube in the same place.`;
+  // Report what is actually analysed. getSettings() on Android reports the
+  // sensor's own orientation (720x1280) while the element decodes it rotated
+  // (1280x720), and every measurement uses the element -- so quoting the
+  // track made the app look misconfigured when it was not.
+  $("calHint").textContent = `Camera at ${vid.videoWidth}×${vid.videoHeight}. Two stills, ` +
+    `nothing in between: a full bobbin, then the bare tube in the same place. ` +
+    `Lock exposure and white balance first if the camera app allows it.`;
 };
 
 $("srcFile").onclick = () => $("playFile").click();
@@ -592,7 +613,8 @@ function measureDetail(img) {
   const x0 = Math.max(0, Math.floor(Math.min(...xs))), x1 = Math.min(img.width - 1, Math.ceil(Math.max(...xs)));
   const y0 = Math.max(0, Math.floor(Math.min(...ys))), y1 = Math.min(img.height - 1, Math.ceil(Math.max(...ys)));
   const d = img.data, warmPts = [];
-  let inside = 0, warm = 0;
+  const thr = cal.creamWarm ?? CV.CREAM_WARM;
+  let inside = 0, warm = 0, warmMax = -255;
   for (let y = y0; y <= y1; y++) {
     for (let x = x0; x <= x1; x++) {
       const dx = x - r.p1[0], dy = y - r.p1[1];
@@ -602,10 +624,13 @@ function measureDetail(img) {
       if (s < -r.hw || s > r.hw) continue;
       inside++;
       const p = (y * img.width + x) * 4;
-      if (d[p] - d[p + 2] > CV.CREAM_WARM) { warm++; if (!(x % 2) && !(y % 2)) warmPts.push(x, y); }
+      const v = d[p] - d[p + 2];
+      if (v > warmMax) warmMax = v;
+      if (v > thr) { warm++; if (!(x % 2) && !(y % 2)) warmPts.push(x, y); }
     }
   }
-  return { pct: inside ? (100 * warm) / inside : null, w: img.width, h: img.height, warmPts };
+  return { pct: inside ? (100 * warm) / inside : null, w: img.width, h: img.height,
+           warmPts, warmMax };
 }
 
 /* ---- the run ----------------------------------------------------------- */
@@ -674,11 +699,18 @@ function loop() {
   drawOverlay(detail);
   if (detail.pct === null) return;
 
+  /* The raw signal next to the threshold it has to clear. A percentage stuck
+     at zero is the same number whether the region is off the barrel, the
+     camera has neutralised the tube, or the tube simply is not bare yet --
+     and these need completely different fixes. The warmest pixel actually
+     inside the region separates them at a glance. */
+  const warmThr = cal.creamWarm ?? CV.CREAM_WARM;
+  $("mWarm").textContent = `warm ${detail.warmMax}/${warmThr}`;
+  $("mWarm").style.color = detail.warmMax < warmThr ? "var(--amber)" : "";
+
   const grid = CV.downsampleGray(img, 32, 18);
   if (refSmall) {
-    let d = 0;
-    for (let i = 0; i < grid.length; i++) d += Math.abs(grid[i] - refSmall[i]);
-    const drift = d / grid.length;
+    const drift = CV.driftCheck(refSmall, img, cal);
     $("mDrift").textContent = drift > DRIFT_WARN ? `drift ${drift.toFixed(0)} — recalibrate?` : "";
     $("mDrift").style.color = drift > DRIFT_WARN ? "var(--amber)" : "";
   }
