@@ -175,6 +175,9 @@
         <button id="reset">Reset</button>
       </div>
       <p class="note" id="runNote"></p>
+      <div class="row">
+        <button id="faultBtn">Also watch for the machine stopping</button>
+      </div>
       <p class="note" id="faultNote"></p>
     </section>
 
@@ -281,6 +284,11 @@ let faultTimers = [], faultFired = false, runStartedAt = 0;
 let prevRoiGray = null, prevGrid = null, quietFor = 0, lastMotion = null;
 let warmupMotion = [], stopAt;      // undefined = not decided yet, null = not armed
 let repeatOn = store.get("repeatOn", true);
+/* Off unless asked for. It shares a notification topic with the depletion
+   alert, so while that is the thing being tested a spurious stop would land
+   as noise on the channel that matters -- and it is still unvalidated on any
+   camera but the iPad. */
+let faultOn = store.get("faultOn", false);
 
 /* ---- setup restore ---------------------------------------------------- */
 $("topic").value = store.get("topic", null) ?? DEFAULT_TOPIC;
@@ -674,7 +682,7 @@ function loop() {
     $("mDrift").textContent = drift > DRIFT_WARN ? `drift ${drift.toFixed(0)} — recalibrate?` : "";
     $("mDrift").style.color = drift > DRIFT_WARN ? "var(--amber)" : "";
   }
-  checkStopped(img, grid);
+  if (faultOn) checkStopped(img, grid);
 
   window_.push(detail.pct);
   if (window_.length > MEDIAN_WINDOW) window_.shift();
@@ -821,6 +829,21 @@ async function sendAlert(_unused, n, total, after) {
 }
 
 $("repeatBtn").onclick = () => { repeatOn = !repeatOn; store.set("repeatOn", repeatOn); paintRepeat(); };
+
+$("faultBtn").onclick = () => {
+  faultOn = !faultOn;
+  store.set("faultOn", faultOn);
+  paintFault();
+  if (!faultOn) { clearFault(); $("faultNote").textContent = ""; $("mMotion").textContent = ""; }
+};
+function paintFault() {
+  $("faultBtn").textContent = faultOn
+    ? "Watching for the machine stopping"
+    : "Also watch for the machine stopping";
+  $("faultBtn").classList.toggle("seg", true);
+  $("faultBtn").classList.toggle("on", faultOn);
+}
+paintFault();
 function paintRepeat() {
   $("repeatBtn").textContent = repeatOn
     ? `Every ${BURST_EVERY}s for ${BURST_UNTIL}s, then backing off`
