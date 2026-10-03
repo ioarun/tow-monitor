@@ -528,6 +528,76 @@ const STOP_HOLD = 15;       // seconds it must stay there
  * "stopped". On the iPad the running median was 2.3-2.75, and the 1.0 that
  * gave zero false alarms over ten minutes is 0.4 of that -- so the fraction
  * is set to reproduce the one setting that has been properly validated. */
+/* --- changed-pixel motion -----------------------------------------------
+ * meanAbsDiff averages how much every sampled pixel changed. Sensor noise is
+ * small but everywhere, so thousands of tiny contributions accumulate into a
+ * floor: on the Android tablet a genuinely stopped machine still read 1.4
+ * against a running 4.9, and the stopped and running bands overlapped. No
+ * threshold separated them, which is why stop detection never fired there.
+ *
+ * Counting instead of averaging removes the floor. Noise rarely moves a pixel
+ * by more than a few grey levels; real motion moves edge pixels by tens. So
+ * ask how MANY samples changed by more than a noise floor, and ignore by how
+ * much. Measured on stop_video.mp4, same ROI, same 2 fps:
+ *
+ *   mean abs diff      stopped 1.93   running  5.98    3.1x, bands overlap
+ *   blur then diff     stopped 0.84   running  4.71    5.6x
+ *   optical flow (LK)  stopped 0.08   running  0.49    6.2x
+ *   changed fraction   stopped 0.47   running 12.55     27x, no false quiet
+ *
+ * Optical flow also works and for the same reason -- noise has no coherent
+ * displacement -- but costs far more to run and port for less separation. */
+const NOISE_PCTL = 99;        // of the whole-frame diff: above this is motion, not noise
+const NOISE_FLOOR_MIN = 4;    // grey levels; below this we are measuring quantisation
+
+/* Raw subsample of the frame, NOT block-averaged. downsampleGray averages,
+ * which suppresses exactly the per-pixel noise this needs to measure. */
+function sampleGray(imageData, step = 8) {
+  const { data, width, height } = imageData;
+  const out = [];
+  for (let y = 0; y < height; y += step)
+    for (let x = 0; x < width; x += step) {
+      const p = (y * width + x) * 4;
+      out.push((data[p] * 299 + data[p + 1] * 587 + data[p + 2] * 114) / 1000);
+    }
+  return Float32Array.from(out);
+}
+
+/* The noise floor for one pair of frames: the Nth percentile of how much the
+ * whole frame changed. The moving part is a small fraction of the frame, so
+ * this percentile is still dominated by pixels that only changed by noise. */
+function noiseFloorFor(now, prev) {
+  if (!now || !prev || now.length !== prev.length) return null;
+  const d = new Float32Array(now.length);
+  for (let i = 0; i < now.length; i++) d[i] = Math.abs(now[i] - prev[i]);
+  const sorted = Array.from(d).sort((a, b) => a - b);
+  return Math.max(NOISE_FLOOR_MIN, percentile(sorted, NOISE_PCTL / 100));
+}
+
+/* Percentage of samples that changed by more than the floor.
+ * The floor must be learned once and then HELD. Recomputing it per sample is
+ * self-defeating: when the machine moves, the percentile rises with it and
+ * suppresses the signal -- measured p99 swung between 6 and 57 on one clip. */
+function changedFraction(now, prev, floor) {
+  if (!now || !prev || now.length !== prev.length || !(floor > 0)) return null;
+  let n = 0;
+  for (let i = 0; i < now.length; i++) if (Math.abs(now[i] - prev[i]) > floor) n++;
+  return (100 * n) / now.length;
+}
+
+/* Running level -> threshold, for the changed-fraction measure. A tenth of
+ * the running level gave zero false quiet across 123 running samples while
+ * still catching 8 of 11 stopped ones; the three it misses are a hand
+ * entering the frame, which is real movement. */
+const CF_STOP_FRACTION = 0.20;
+const CF_STOP_FLOOR = 0.3;     // %, never arm below this
+const CF_RUNNING_MIN = 2.0;    // % changed; below this nothing was running
+
+function cfStopThresholdFrom(runningLevel) {
+  if (!(runningLevel > CF_RUNNING_MIN)) return null;
+  return Math.max(CF_STOP_FLOOR, runningLevel * CF_STOP_FRACTION);
+}
+
 const STOP_FRACTION = 0.4;   // of the running level
 const STOP_FLOOR = 0.4;      // never arm below this, whatever was measured
 const RUNNING_MIN = 0.8;     // below this the machine was not running to begin with
@@ -663,6 +733,8 @@ function downsampleGray(imageData, gw, gh) {
 
 const CV = { GAIN_MIN, CREAM_WARM, BAND_FRACTION, BASELINE_MAX, CEILING_MIN,
              ASPECT_TOLERANCE, ANALYSIS_MAX, STOP_BELOW, STOP_HOLD,
+             sampleGray, noiseFloorFor, changedFraction, cfStopThresholdFrom,
+             NOISE_PCTL, CF_STOP_FRACTION, CF_STOP_FLOOR, CF_RUNNING_MIN,
              STOP_FRACTION, STOP_FLOOR, RUNNING_MIN, stopThresholdFrom,
              GAIN_RANGE, CREAM_RANGE,
              warmth, openBinary, largestComponent, principalAxis, percentile, otsu,

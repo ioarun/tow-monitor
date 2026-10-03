@@ -187,6 +187,11 @@
       <div class="row">
         <button id="faultBtn">Stop detection</button>
       </div>
+      <div class="row">
+        <span class="note" style="margin:0;flex:1">Report stopped after</span>
+        <input type="number" id="stopHold" min="2" max="60" step="1" style="max-width:5em">
+        <span class="note" style="margin:0">s still</span>
+      </div>
       <p class="note" id="faultNote"></p>
     </section>
 
@@ -279,6 +284,12 @@ const BACKOFF_AT = [26, 34, 45, 60, 90, 130, 180];
  * rate limit was checked against. */
 const DEP_EVERY = { min: 2, max: 15, def: 2 };    // depletion, during the burst
 const STOP_EVERY = { min: 5, max: 60, def: 5 };   // stop, until acknowledged
+/* How long the machine must read still before it is called stopped. Adjustable
+   at run time because the right value is a judgement about this machine, not a
+   property of the detector: a real fault lasts until someone intervenes, so a
+   long hold costs nothing and buys margin, while a short one also reports the
+   brief stops an operator makes deliberately. */
+const STOP_HOLD_R = { min: 2, max: 60, def: 15 };
 const STOP_FOR_S = 300;     // ...and no longer than this, whatever the interval
 
 /* A stopped machine keeps notifying every STOP_EVERY seconds until someone
@@ -294,6 +305,7 @@ const STOP_FOR_S = 300;     // ...and no longer than this, whatever the interval
  * walk to a machine, and holds however the interval is set. */
 
 const MOTION_WARMUP = 10;   // s before stop detection arms — lets AE settle
+const NOISE_WARMUP = 3;     // s of that spent learning the sensor's noise floor
 
 
 const store = {
@@ -330,6 +342,8 @@ const clampNum = (v, r) => Math.max(r.min, Math.min(r.max, v || r.def));
 let depEvery = clampNum(+store.get("depEvery", DEP_EVERY.def), DEP_EVERY);
 let stopEvery = clampNum(+store.get("stopEvery", STOP_EVERY.def), STOP_EVERY);
 let faultOn = store.get("faultOn", true);
+let stopHold = clampNum(+store.get("stopHold", STOP_HOLD_R.def), STOP_HOLD_R);
+let noiseFloor = null, noiseSamples = [], prevFull = null;
 
 /* ---- setup restore ---------------------------------------------------- */
 $("topic").value = store.get("topic", null) ?? DEFAULT_TOPIC;
@@ -686,6 +700,7 @@ function resetRun() {
   faultFired = false; quietFor = 0; lastMotion = null;
   prevRoiGray = prevGrid = null;
   warmupMotion = []; stopAt = undefined;
+  noiseFloor = null; noiseSamples = []; prevFull = null;
   if (alertKind === "stopped") hideAlertScreen();
   $("faultNote").textContent = ""; $("mMotion").textContent = "";
   window_ = []; clamped = 0; consecutive = 0; fired = false; lastSampleT = -Infinity;
@@ -834,19 +849,42 @@ function loop() {
    ten-second hold, and the suppressions below. */
 function checkStopped(img, grid) {
   const roi = CV.roiGray(img, cal);
-  const m = CV.netMotion(roi, prevRoiGray, grid, prevGrid);
-  prevRoiGray = roi; prevGrid = grid;
+  const full = CV.sampleGray(img, 8);
+  const age = performance.now() / 1000 - runStartedAt;
+
+  /* Phase 1 of the warm-up: learn this sensor's noise floor from the whole
+     frame. It must be learned once and then held -- recomputing it per sample
+     is self-defeating, because the percentile rises with the motion it is
+     meant to exclude (measured swinging between 6 and 57 on one clip). */
+  if (age < NOISE_WARMUP) {
+    const f = CV.noiseFloorFor(full, prevFull);
+    if (f !== null) noiseSamples.push(f);
+    prevRoiGray = roi; prevFull = full; prevGrid = grid;
+    $("mMotion").textContent = `calibrating noise · ${Math.ceil(NOISE_WARMUP - age)}s`;
+    $("mMotion").style.color = "";
+    return;
+  }
+  if (noiseFloor === null) {
+    const srt = [...noiseSamples].sort((a, b) => a - b);
+    noiseFloor = srt.length ? srt[srt.length >> 1] : 8;
+  }
+
+  /* Count how many samples changed by more than the floor, rather than
+     averaging how much they all changed. Averaging lets small per-pixel noise
+     accumulate into a floor a stopped machine never gets under: on the Android
+     tablet that floor was 1.4 against a running 4.9, and the two bands
+     overlapped so no threshold separated them. Counting separates them 27x. */
+  const m = CV.changedFraction(roi, prevRoiGray, noiseFloor);
+  prevRoiGray = roi; prevFull = full; prevGrid = grid;
   if (m === null) return;
   lastMotion = m;
 
-  const age = performance.now() / 1000 - runStartedAt;
-
-  /* Spend the warm-up learning what this camera reads while the machine runs,
-     rather than assuming. A static scene reads 0.00 on one device and 1.57 on
-     another, so no fixed number can mean "still" on both. */
+  /* Phase 2: learn what this camera reads while the machine runs. A static
+     scene reads differently on every device, so no fixed number means "still"
+     on all of them. */
   if (age < MOTION_WARMUP) {
     warmupMotion.push(m);
-    $("mMotion").textContent = `motion ${m.toFixed(1)} · learning ${Math.ceil(MOTION_WARMUP - age)}s`;
+    $("mMotion").textContent = `motion ${m.toFixed(1)}% · learning ${Math.ceil(MOTION_WARMUP - age)}s`;
     $("mMotion").style.color = "";
     return;
   }
@@ -854,24 +892,25 @@ function checkStopped(img, grid) {
   if (stopAt === undefined) {
     const sorted = [...warmupMotion].sort((a, b) => a - b);
     const level = sorted.length ? sorted[sorted.length >> 1] : 0;
-    stopAt = CV.stopThresholdFrom(level);
+    stopAt = CV.cfStopThresholdFrom(level);
     /* Refusing to arm matters more than it looks. A detector that learned its
        baseline from an already-stopped machine would never fire again, and
        would be indistinguishable from one quietly working. */
     $("faultNote").className = "note" + (stopAt === null ? " warn" : "");
     $("faultNote").textContent = stopAt === null
       ? `Stop detection NOT armed — nothing was moving during the first ${MOTION_WARMUP}s ` +
-        `(motion ${level.toFixed(1)}). Start the machine, then press Reset.`
-      : `Stop detection armed: running at ${level.toFixed(1)}, reports stopped below ` +
-        `${stopAt.toFixed(1)} held for ${CV.STOP_HOLD}s.`;
+        `(motion ${level.toFixed(1)}%). Start the machine, then press Reset.`
+      : `Stop detection armed: running at ${level.toFixed(1)}%, noise floor ` +
+        `${noiseFloor.toFixed(0)}, reports stopped below ${stopAt.toFixed(1)}% ` +
+        `held for ${stopHold}s.`;
   }
   if (stopAt === null) {
-    $("mMotion").textContent = `motion ${m.toFixed(1)} · stop detection off`;
+    $("mMotion").textContent = `motion ${m.toFixed(1)}% · stop detection off`;
     return;
   }
 
   quietFor = m < stopAt ? quietFor + SAMPLE_S : 0;
-  $("mMotion").textContent = `motion ${m.toFixed(1)}/${stopAt.toFixed(1)}` +
+  $("mMotion").textContent = `motion ${m.toFixed(1)}%/${stopAt.toFixed(1)}%` +
     (quietFor >= SAMPLE_S ? ` · still ${quietFor.toFixed(0)}s` : "");
   $("mMotion").style.color = quietFor >= SAMPLE_S ? "var(--amber)" : "";
 
@@ -883,7 +922,7 @@ function checkStopped(img, grid) {
   // A paused or finished clip is not a stopped machine.
   if (source === "file" && (vid.paused || vid.ended)) return;
 
-  if (quietFor >= CV.STOP_HOLD) { faultFired = true; fireFault(); }
+  if (quietFor >= stopHold) { faultFired = true; fireFault(); }
 }
 
 function clearFault() {
@@ -897,13 +936,13 @@ function fireFault() {
   $("dot").className = "dot warn";
   $("faultNote").className = "note warn";
   $("faultNote").textContent =
-    `Machine appears to have stopped — no movement for ${CV.STOP_HOLD}s. Notifying.`;
+    `Machine appears to have stopped — no movement for ${stopHold}s. Notifying.`;
   /* Two beeps, not the depletion alarm. A stop costs idle time and nothing
      else, so it gets a sound you can tell apart from the one that means walk
      to the machine now. */
   if (audio) { const t = audio.currentTime; beep(t, 440, 0.18); beep(t + 0.3, 330, 0.28); }
   showAlertScreen("stopped", "MACHINE STOPPED",
-    `The unwind bobbin has not moved for ${CV.STOP_HOLD}s — go and look.`);
+    `The unwind bobbin has not moved for ${stopHold}s — go and look.`);
   clearFault();
   faultSends = faultOk = faultFail = 0;
   const since = Date.now();
@@ -921,7 +960,7 @@ function fireFault() {
     const ago = Math.round((Date.now() - since) / 1000);
     const r = await notify(
       ago < stopEvery
-        ? `The unwind bobbin stopped turning — no movement for ${CV.STOP_HOLD}s`
+        ? `The unwind bobbin stopped turning — no movement for ${stopHold}s`
         : `Still stopped after ${elapsed(ago)} — nobody has been to the machine`,
       ago < stopEvery ? "Machine stopped" : `Machine stopped — ${elapsed(ago)}`);
     if (r === true) faultOk++; else faultFail++;
@@ -996,6 +1035,11 @@ $("depEvery").oninput = () => {
 $("stopEvery").oninput = () => {
   stopEvery = clampNum(+$("stopEvery").value, STOP_EVERY);
   store.set("stopEvery", stopEvery); paintIntervals();
+};
+$("stopHold").value = stopHold;
+$("stopHold").oninput = () => {
+  stopHold = clampNum(+$("stopHold").value, STOP_HOLD_R);
+  store.set("stopHold", stopHold);
 };
 
 function paintIntervals() {
