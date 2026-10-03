@@ -1,7 +1,7 @@
 /* Core-exposure detection, in plain JS.
  *
  * A port of poc/roi.py + poc/fit_roi_auto.py with no dependencies, so the whole
- * pipeline can run in Safari on the iPad with no server behind it. OpenCV.js
+ * pipeline can run in the browser on the tablet with no server behind it. OpenCV.js
  * would have been the obvious route and is the wrong one here: 8 MB to download
  * over a hotspot to replace maybe 200 lines of array arithmetic.
  *
@@ -16,7 +16,8 @@
  * what proves these numbers still match the Python they came from.
  */
 
-/* Both thresholds below are FALLBACKS. They were hand-tuned on one iPad, and
+/* Both thresholds below are FALLBACKS. They were hand-tuned on one device (an
+ * iPad, which is no longer the one in use), and
  * an absolute R-B value is a property of that camera's sensor and colour
  * processing, not of carbon tow or cardboard -- which made them the reason the
  * pipeline could not be trusted on a device it had not been tuned against.
@@ -50,7 +51,7 @@ const CEILING_GOOD = 95.0;  // % preferred when choosing between candidate regio
 const REGION_ASPECT_MIN = 3.0;
 const ASPECT_TOLERANCE = 0.02;   // 2% — covers rounding, not a real reframing
 
-/* Longest side the analysis runs at. An iPad records at 1080p or 4K, and
+/* Longest side the analysis runs at. A tablet records at 1080p or 4K, and
  * calibrate() touches every pixel twice for the opening and once more for the
  * flood fill -- at 4K that is 8.3 M pixels and several seconds of a frozen UI.
  * Downscaling is free here only because the geometry is stored as fractions of

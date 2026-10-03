@@ -94,7 +94,7 @@
   .thumb.has { border-style:solid; border-color:var(--cyan); }
   .hidden { display:none !important; }
 
-  /* The alert takes the whole screen. An iPad propped by a machine is read
+  /* The alert takes the whole screen. A tablet propped by a machine is read
      from across the room, so the signal is the field of colour. */
   /* Same screen for both alerts, different colour. A stop reads as amber
      rather than red because its cost is idle time, and the operator should be
@@ -264,7 +264,7 @@ const DEFAULT_TOPIC = "498d75d8515d7ea004b7ac86";
  * now an idle machine rather than a re-thread -- so the schedule backs off
  * rather than keeping the same pace.
  *
- * It stops when Acknowledge is pressed on the iPad, which happens when you
+ * It stops when Acknowledge is pressed on the tablet, which happens when you
  * reach the machine, so arriving is what silences it. The tail exists so a
  * run left unattended eventually stops buzzing instead of going all
  * afternoon.
@@ -316,7 +316,7 @@ const store = {
 
 let cal = store.get("cal", null);
 /* A calibration saved before the thresholds became per-camera has no
-   creamWarm, so measure() falls back to the constant tuned on one iPad. On a
+   creamWarm, so measure() falls back to the constant hand-tuned on one device. On a
    sensor whose warmest pixel is 43 that constant is 45, and every reading is
    zero forever -- with a green "calibrated" chip above it, because the stored
    baseline and ceiling were true when they were written. Discard it rather
@@ -360,7 +360,7 @@ paintNetChip();
 if (calStale)
   calMsg("Your saved calibration was made before this app worked out colour thresholds " +
          "per camera, so it has been discarded — it would have read 0% forever on any " +
-         "device but the original iPad. Please calibrate again.", "warn");
+         "device but the one it was fitted on. Please calibrate again.", "warn");
 $("mThr").textContent = "fires at " + $("thr").value + "%";
 
 $("topic").oninput = () => { store.set("topic", $("topic").value.trim()); paintNetChip(); };
@@ -1013,7 +1013,7 @@ async function sendAlert(_unused, n, total, after) {
   $("runNote").className = "note " + (sendsOk ? "ok" : "warn");
   $("runNote").textContent = sendsOk
     ? `Alert sent to your phone${tail}.` + (sendsFail ? ` ${sendsFail} failed.` : "")
-    : `Alert NOT sent (${r})${tail}. The iPad alarm is your only warning.`;
+    : `Alert NOT sent (${r})${tail}. The tablet alarm is your only warning.`;
   $("alertSends").textContent = sendsOk
     ? `Notified your phone ${sendsOk}×${sendsFail ? `, ${sendsFail} failed` : ""}` +
       (n < total ? " — repeating until acknowledged" : "")
@@ -1094,7 +1094,7 @@ $("testNtfy").onclick = async () => {
   n.className = "note " + (r === true ? "ok" : "bad");
   n.textContent = r === true
     ? "Sent. It should appear on your phone within a second or two."
-    : "Failed: " + r + ". Check the hotspot is on and this iPad has joined it.";
+    : "Failed: " + r + ". Check the hotspot is on and this tablet has joined it.";
 };
 
 /* ---- alarm ------------------------------------------------------------- */
