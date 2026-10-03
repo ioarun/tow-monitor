@@ -1,10 +1,15 @@
-/* Cache the app shell so the iPad still opens it with no internet.
+/* Cache the app shell so the tablet still opens it with no internet.
  *
  * The workshop has no connectivity of its own: the only link is the phone's
  * hotspot, and that is there for the alert, not for loading the page. Cache
  * first means the app starts even when the hotspot is off or out of signal.
  */
-const CACHE = "tow-monitor-v19";
+/* Cache-first, so the app starts with no connectivity. The cost is that the
+ * device keeps serving this cache until the name changes -- publishing new
+ * files without changing it ships nothing to the device. The publish
+ * workflow rewrites this line with the source commit, so it cannot be
+ * forgotten; the value here is only what a local checkout uses. */
+const CACHE = "tow-monitor-d91c71c";
 const SHELL = ["./", "./index.html", "./cv.js", "./manifest.webmanifest"];
 
 self.addEventListener("install", e => {
