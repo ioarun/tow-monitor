@@ -220,6 +220,25 @@
     </section>
 
     <section>
+      <span class="lbl">Speaker announcements</span>
+      <div class="row">
+        <button id="sayBtn">Announce</button>
+      </div>
+      <div class="row">
+        <span class="note" style="margin:0;flex:1">Bobbin low, every</span>
+        <input type="number" id="sayLow" min="0.5" max="30" step="0.5" style="max-width:5em">
+        <span class="note" style="margin:0">s</span>
+      </div>
+      <div class="row">
+        <span class="note" style="margin:0;flex:1">Machine stopped, every</span>
+        <input type="number" id="sayStop" min="0.5" max="60" step="0.5" style="max-width:5em">
+        <span class="note" style="margin:0">s</span>
+      </div>
+      <p class="note" id="sayNote">Spoken through whatever speaker this tablet is paired
+        to. A Bluetooth speaker will stop whatever else it is playing and not resume.</p>
+    </section>
+
+    <section>
       <span class="lbl">Alert threshold</span>
       <div class="row">
         <input type="number" id="thr" min="1" max="90" step="1" value="5">
@@ -304,6 +323,26 @@ const STOP_FOR_S = 300;     // ...and no longer than this, whatever the interval
  * STOP_FOR_S is five minutes, which is far longer than it should take to
  * walk to a machine, and holds however the interval is set. */
 
+/* Spoken announcements, for a speaker paired to the tablet.
+ *
+ * A Bluetooth speaker holds one audio stream at a time, so an announcement
+ * takes the speaker away from whatever else is playing and does not give it
+ * back -- the music stops and stays stopped. That is a free and unmissable
+ * attention signal, which is why these phrases are short and carry no detail:
+ * by the time the words arrive, the silence has already done the work.
+ *
+ * Intervals are the operator's, for the same reason the notification ones are.
+ * Below about a second the next announcement cuts off the previous mid-word,
+ * since speak() cancels first so the newest state always wins. */
+const SAY_EVERY = { low:     { min: 0.5, max: 30, def: 1.5 },
+                    stopped: { min: 0.5, max: 60, def: 3 } };
+const SAY_TEXT  = { low: "Bobbin low", stopped: "Machine stopped" };
+
+/* Sustained motion needed to clear a stop alert on its own. Short, because a
+   running machine is unambiguous once it has run for a couple of seconds, and
+   the cost of clearing late is only that the screen stays up a moment longer. */
+const RESUME_HOLD = 2;
+
 const MOTION_WARMUP = 10;   // s before stop detection arms — lets AE settle
 const NOISE_WARMUP = 3;     // s of that spent learning the sensor's noise floor
 
@@ -337,11 +376,16 @@ let alertKind = null;              // "low" | "stopped" | null — which screen 
 let faultTimers = [], faultTicker = null, faultFired = false, runStartedAt = 0;
 let faultSends = 0, faultOk = 0, faultFail = 0;
 let prevRoiGray = null, prevGrid = null, quietFor = 0, lastMotion = null;
+let movingFor = 0, stoppedSince = null;
 let warmupMotion = [], stopAt;      // undefined = not decided yet, null = not armed
 const clampNum = (v, r) => Math.max(r.min, Math.min(r.max, v || r.def));
 let depEvery = clampNum(+store.get("depEvery", DEP_EVERY.def), DEP_EVERY);
 let stopEvery = clampNum(+store.get("stopEvery", STOP_EVERY.def), STOP_EVERY);
 let faultOn = store.get("faultOn", true);
+let sayOn = store.get("sayOn", true);
+let sayEvery = { low: clampNum(+store.get("sayLow", SAY_EVERY.low.def), SAY_EVERY.low),
+                 stopped: clampNum(+store.get("sayStop", SAY_EVERY.stopped.def), SAY_EVERY.stopped) };
+let sayTimer = null;
 let stopHold = clampNum(+store.get("stopHold", STOP_HOLD_R.def), STOP_HOLD_R);
 let noiseFloor = null, noiseSamples = [], prevFull = null;
 
@@ -697,7 +741,7 @@ $("reset").onclick = () => {
 
 function resetRun() {
   clearRepeats(); clearFault();
-  faultFired = false; quietFor = 0; lastMotion = null;
+  faultFired = false; quietFor = 0; movingFor = 0; stoppedSince = null; lastMotion = null;
   prevRoiGray = prevGrid = null;
   warmupMotion = []; stopAt = undefined;
   noiseFloor = null; noiseSamples = []; prevFull = null;
@@ -764,6 +808,13 @@ async function startRun() {
   // and it has to happen before anything needs to make a sound.
   audio = audio || new (window.AudioContext || window.webkitAudioContext)();
   await audio.resume();
+  /* Speech needs a user gesture to unlock too, and the alert comes long after
+     the last tap. Prime it here, silently, on the one tap guaranteed to
+     happen before any alert can fire. */
+  if (sayOn && "speechSynthesis" in window) {
+    const u = new SpeechSynthesisUtterance(" ");
+    u.volume = 0; speechSynthesis.speak(u);
+  }
   try { wakeLock = await navigator.wakeLock?.request("screen"); } catch {}
   if (source === "file") { vid.playbackRate = rate; await vid.play(); }
   running = true;
@@ -910,9 +961,35 @@ function checkStopped(img, grid) {
   }
 
   quietFor = m < stopAt ? quietFor + SAMPLE_S : 0;
+  movingFor = m >= stopAt ? movingFor + SAMPLE_S : 0;
   $("mMotion").textContent = `motion ${m.toFixed(1)}%/${stopAt.toFixed(1)}%` +
     (quietFor >= SAMPLE_S ? ` · still ${quietFor.toFixed(0)}s` : "");
   $("mMotion").style.color = quietFor >= SAMPLE_S ? "var(--amber)" : "";
+
+  /* A stop alert answers itself once the machine runs again, however it came
+     to be running. The usual path is the operator walking over, fixing it and
+     restarting -- at which point making them come back and press a button to
+     acknowledge a condition that is already over is pure friction. The screen
+     goes on its own.
+
+     Sustained motion rather than one sample, so a single noisy frame cannot
+     cancel a real alert. Acknowledge stays for the case the detector cannot
+     see the motion at all.
+
+     It does not vanish without trace: a stop that happened is worth knowing
+     about afterwards, so the note records it and how long it lasted. */
+  if (faultFired && movingFor >= RESUME_HOLD) {
+    const was = stoppedSince ? elapsed(Math.round((Date.now() - stoppedSince) / 1000)) : "a moment";
+    clearFault(); clearAlarm();
+    if (alertKind === "stopped") hideAlertScreen();
+    faultFired = false; quietFor = 0; stoppedSince = null;
+    $("faultNote").className = "note";
+    $("faultNote").textContent =
+      `Machine running again after ${was} — alert cleared, no acknowledgement needed.`;
+    $("dot").className = running ? "dot live" : "dot";
+    $("mState").textContent = running ? "monitoring" : "idle";
+    return;
+  }
 
   if (faultFired) return;
   // A stop right after the depletion alert is the operator doing exactly what
@@ -922,7 +999,7 @@ function checkStopped(img, grid) {
   // A paused or finished clip is not a stopped machine.
   if (source === "file" && (vid.paused || vid.ended)) return;
 
-  if (quietFor >= stopHold) { faultFired = true; fireFault(); }
+  if (quietFor >= stopHold) { faultFired = true; stoppedSince = Date.now(); fireFault(); }
 }
 
 function clearFault() {
@@ -1036,6 +1113,32 @@ $("stopEvery").oninput = () => {
   stopEvery = clampNum(+$("stopEvery").value, STOP_EVERY);
   store.set("stopEvery", stopEvery); paintIntervals();
 };
+$("sayLow").value = sayEvery.low;
+$("sayStop").value = sayEvery.stopped;
+function paintSay() {
+  $("sayBtn").textContent = sayOn ? "Announce: ON" : "Announce: OFF";
+  $("sayBtn").classList.toggle("seg", true);
+  $("sayBtn").classList.toggle("on", sayOn);
+}
+paintSay();
+$("sayBtn").onclick = () => {
+  sayOn = !sayOn; store.set("sayOn", sayOn); paintSay();
+  if (!sayOn) stopSaying();
+  else if (alertKind) startSaying(alertKind);    // take effect on the alert already up
+};
+/* Retime while an alert is announcing, rather than on the next one -- the
+   interval is only judgeable against the speaker, in the moment. */
+$("sayLow").oninput = () => {
+  sayEvery.low = clampNum(+$("sayLow").value, SAY_EVERY.low);
+  store.set("sayLow", sayEvery.low);
+  if (alertKind === "low" && sayTimer) startSaying("low");
+};
+$("sayStop").oninput = () => {
+  sayEvery.stopped = clampNum(+$("sayStop").value, SAY_EVERY.stopped);
+  store.set("sayStop", sayEvery.stopped);
+  if (alertKind === "stopped" && sayTimer) startSaying("stopped");
+};
+
 $("stopHold").value = stopHold;
 $("stopHold").oninput = () => {
   stopHold = clampNum(+$("stopHold").value, STOP_HOLD_R);
@@ -1108,6 +1211,29 @@ function beep(t0, freq, dur) {
   o.connect(g).connect(audio.destination);
   o.start(t0); o.stop(t0 + dur + 0.02);
 }
+/* cancel() first: a backlog would still be reading out alerts from a minute
+   ago, and the newest state is the only one worth hearing. */
+function speak(text) {
+  if (!sayOn || !("speechSynthesis" in window)) return;
+  const u = new SpeechSynthesisUtterance(text);
+  u.rate = 1; u.volume = 1;
+  speechSynthesis.cancel();
+  speechSynthesis.speak(u);
+}
+
+function startSaying(kind) {
+  stopSaying();
+  if (!sayOn) return;
+  const text = SAY_TEXT[kind], every = sayEvery[kind] * 1000;
+  speak(text);
+  sayTimer = setInterval(() => speak(text), every);
+}
+
+function stopSaying() {
+  clearInterval(sayTimer); sayTimer = null;
+  if ("speechSynthesis" in window) speechSynthesis.cancel();
+}
+
 let alarmTimer = null;
 function burst() {
   if (!audio) return;
@@ -1116,6 +1242,7 @@ function burst() {
 }
 function startAlarm() {
   if (alarmTimer) return;
+  startSaying(alertKind);
   burst();
   alarmTimer = setInterval(burst, 1800);
   flashTimer = setInterval(() => $("alert").classList.toggle("flash"), 480);
@@ -1129,6 +1256,7 @@ function showAlertScreen(kind, title, message) {
 }
 
 function hideAlertScreen() {
+  stopSaying();
   alertKind = null;
   $("alert").classList.add("hidden");
   $("alert").classList.remove("flash", "stopped");
@@ -1139,9 +1267,14 @@ function hideAlertScreen() {
    queued notifications and leaves the run going -- Stop and Reset would end
    it, and ending a run also discards the baseline reseeded for the bobbin
    currently on the machine. */
-$("alertAck").onclick = () => {
+function clearAlarm() {
   clearInterval(alarmTimer); alarmTimer = null;
   clearInterval(flashTimer); flashTimer = null;
+  stopSaying();
+}
+
+$("alertAck").onclick = () => {
+  clearAlarm();
   const wasStop = alertKind === "stopped";
   if (wasStop) {
     clearFault();
