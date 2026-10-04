@@ -9,7 +9,7 @@
  * files without changing it ships nothing to the device. The publish
  * workflow rewrites this line with the source commit, so it cannot be
  * forgotten; the value here is only what a local checkout uses. */
-const CACHE = "tow-monitor-e8b39b2";
+const CACHE = "tow-monitor-14fd6ca";
 const SHELL = ["./", "./index.html", "./cv.js", "./manifest.webmanifest"];
 
 self.addEventListener("install", e => {

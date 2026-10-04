@@ -187,11 +187,6 @@
       <div class="row">
         <button id="faultBtn">Stop detection</button>
       </div>
-      <div class="row">
-        <span class="note" style="margin:0;flex:1">Report stopped after</span>
-        <input type="number" id="stopHold" min="2" max="60" step="1" style="max-width:5em">
-        <span class="note" style="margin:0">s still</span>
-      </div>
       <p class="note" id="faultNote"></p>
     </section>
 
@@ -303,12 +298,7 @@ const BACKOFF_AT = [26, 34, 45, 60, 90, 130, 180];
  * rate limit was checked against. */
 const DEP_EVERY = { min: 2, max: 15, def: 2 };    // depletion, during the burst
 const STOP_EVERY = { min: 5, max: 60, def: 5 };   // stop, until acknowledged
-/* How long the machine must read still before it is called stopped. Adjustable
-   at run time because the right value is a judgement about this machine, not a
-   property of the detector: a real fault lasts until someone intervenes, so a
-   long hold costs nothing and buys margin, while a short one also reports the
-   brief stops an operator makes deliberately. */
-const STOP_HOLD_R = { min: 2, max: 60, def: 15 };
+
 const STOP_FOR_S = 300;     // ...and no longer than this, whatever the interval
 
 /* A stopped machine keeps notifying every STOP_EVERY seconds until someone
@@ -334,7 +324,7 @@ const STOP_FOR_S = 300;     // ...and no longer than this, whatever the interval
  * Intervals are the operator's, for the same reason the notification ones are.
  * Below about a second the next announcement cuts off the previous mid-word,
  * since speak() cancels first so the newest state always wins. */
-const SAY_EVERY = { low:     { min: 0.5, max: 30, def: 1.5 },
+const SAY_EVERY = { low:     { min: 0.5, max: 30, def: 2 },
                     stopped: { min: 0.5, max: 60, def: 3 } };
 const SAY_TEXT  = { low: "Bobbin low", stopped: "Machine stopped" };
 
@@ -386,7 +376,6 @@ let sayOn = store.get("sayOn", true);
 let sayEvery = { low: clampNum(+store.get("sayLow", SAY_EVERY.low.def), SAY_EVERY.low),
                  stopped: clampNum(+store.get("sayStop", SAY_EVERY.stopped.def), SAY_EVERY.stopped) };
 let sayTimer = null;
-let stopHold = clampNum(+store.get("stopHold", STOP_HOLD_R.def), STOP_HOLD_R);
 let noiseFloor = null, noiseSamples = [], prevFull = null;
 
 /* ---- setup restore ---------------------------------------------------- */
@@ -952,8 +941,7 @@ function checkStopped(img, grid) {
       ? `Stop detection NOT armed — nothing was moving during the first ${MOTION_WARMUP}s ` +
         `(motion ${level.toFixed(1)}%). Start the machine, then press Reset.`
       : `Stop detection armed: running at ${level.toFixed(1)}%, noise floor ` +
-        `${noiseFloor.toFixed(0)}, reports stopped below ${stopAt.toFixed(1)}% ` +
-        `held for ${stopHold}s.`;
+        `${noiseFloor.toFixed(0)}, reports stopped below ${stopAt.toFixed(1)}%.`;
   }
   if (stopAt === null) {
     $("mMotion").textContent = `motion ${m.toFixed(1)}% · stop detection off`;
@@ -999,7 +987,13 @@ function checkStopped(img, grid) {
   // A paused or finished clip is not a stopped machine.
   if (source === "file" && (vid.paused || vid.ended)) return;
 
-  if (quietFor >= stopHold) { faultFired = true; stoppedSince = Date.now(); fireFault(); }
+  /* Fire on the first quiet sample rather than holding. The hold existed
+     because the old motion measure's running and stopped bands overlapped, so
+     a single sample meant nothing; counting changed pixels separates them by
+     27x and produced no false quiet in 109 running samples, which makes the
+     delay cost without benefit. A stop is reported within one sample -- half
+     a second -- and the repeat interval below carries it from there. */
+  if (quietFor > 0) { faultFired = true; stoppedSince = Date.now(); fireFault(); }
 }
 
 function clearFault() {
@@ -1013,13 +1007,13 @@ function fireFault() {
   $("dot").className = "dot warn";
   $("faultNote").className = "note warn";
   $("faultNote").textContent =
-    `Machine appears to have stopped — no movement for ${stopHold}s. Notifying.`;
+    `Machine appears to have stopped — the bobbin is not turning. Notifying.`;
   /* Two beeps, not the depletion alarm. A stop costs idle time and nothing
      else, so it gets a sound you can tell apart from the one that means walk
      to the machine now. */
   if (audio) { const t = audio.currentTime; beep(t, 440, 0.18); beep(t + 0.3, 330, 0.28); }
   showAlertScreen("stopped", "MACHINE STOPPED",
-    `The unwind bobbin has not moved for ${stopHold}s — go and look.`);
+    `The unwind bobbin has stopped turning — go and look.`);
   clearFault();
   faultSends = faultOk = faultFail = 0;
   const since = Date.now();
@@ -1037,7 +1031,7 @@ function fireFault() {
     const ago = Math.round((Date.now() - since) / 1000);
     const r = await notify(
       ago < stopEvery
-        ? `The unwind bobbin stopped turning — no movement for ${stopHold}s`
+        ? `The unwind bobbin stopped turning — go and look`
         : `Still stopped after ${elapsed(ago)} — nobody has been to the machine`,
       ago < stopEvery ? "Machine stopped" : `Machine stopped — ${elapsed(ago)}`);
     if (r === true) faultOk++; else faultFail++;
@@ -1139,11 +1133,6 @@ $("sayStop").oninput = () => {
   if (alertKind === "stopped" && sayTimer) startSaying("stopped");
 };
 
-$("stopHold").value = stopHold;
-$("stopHold").oninput = () => {
-  stopHold = clampNum(+$("stopHold").value, STOP_HOLD_R);
-  store.set("stopHold", stopHold);
-};
 
 function paintIntervals() {
   $("depEvery").value = depEvery;
