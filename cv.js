@@ -489,46 +489,17 @@ function driftCheck(refSmall, imageData, cal, gridW = 32, gridH = 18) {
 }
 
 /* --- motion, for detecting that the machine has stopped -----------------
- * The bobbin turning is the only thing in the ROI that changes, so frame
+ * The bobbin turning is the only thing in the region that changes, so frame
  * differencing there measures whether the machine is running.
  *
- * Differencing the ROI alone does not work: auto-exposure steps, a knock, a
- * cloud over a skylight all move every pixel in the frame at once, and read
- * as motion. The fix is to difference a second region that cannot move and
- * subtract it. The whole-frame 32x18 grid serves, and needs no per-framing
- * setup -- the ROI is a few percent of the frame, so the grid is dominated
- * by things that stay put, which makes it a measure of the common mode.
- *
- * Measured on two clips of a running machine (~10 min, 1204 samples at
- * 2 fps): net motion ran at a median of 2.3-2.75, and the longest stretch
- * that fell below 1.0 was 5.5 s. So STOP_BELOW sits about 2.5x under the
- * running signal and STOP_HOLD nearly 3x past the longest quiet patch the
- * footage produced.
- *
- * The hold is set by what a false alarm costs, not by how fast detection
- * could be. The PRD allows 60 s to notice a stop and says idle time is the
- * only cost -- while a fault alert that cries wolf gets muted, and it shares
- * a channel with the depletion alert, so muting it disables that too. Buying
- * margin with latency is therefore almost free, and 15 s spends a quarter of
- * the budget to nearly triple the margin. */
-const STOP_BELOW = 1.0;     // FALLBACK only — see stopThresholdFrom()
-const STOP_HOLD = 15;       // seconds it must stay there
+ * What was here first -- a mean absolute difference, minus the whole-frame
+ * difference as a common-mode term, against a threshold held for 15 s -- is
+ * gone. It could not separate a stopped machine from a running one on the
+ * Android tablet: the two bands overlapped, so no threshold existed that
+ * would have worked. The method that replaced it is below; the reasoning is
+ * in the manual, section 2.6 for why it failed and 2.8 for what it became.
+ */
 
-/* The stop threshold cannot be a constant either, for the same reason the
- * colour thresholds could not be: it is a grey-level difference, so it is a
- * property of the sensor's noise rather than of the machine.
- *
- * Measured on a static scene: the iPad reads a median net motion of 0.00,
- * while an Android tablet reads 0.69 in one clip and 1.57 in another -- two
- * recordings of the same stationary rig, minutes apart. At STOP_BELOW = 1.0
- * the second of those reads as "still moving", so a genuinely stopped machine
- * would never be reported.
- *
- * So learn it instead, from the machine running. Take the median net motion
- * over the first MOTION_WARMUP seconds of a run and call a fraction of it
- * "stopped". On the iPad the running median was 2.3-2.75, and the 1.0 that
- * gave zero false alarms over ten minutes is 0.4 of that -- so the fraction
- * is set to reproduce the one setting that has been properly validated. */
 /* --- changed-pixel motion -----------------------------------------------
  * meanAbsDiff averages how much every sampled pixel changed. Sensor noise is
  * small but everywhere, so thousands of tiny contributions accumulate into a
@@ -597,19 +568,6 @@ const CF_RUNNING_MIN = 2.0;    // % changed; below this nothing was running
 function cfStopThresholdFrom(runningLevel) {
   if (!(runningLevel > CF_RUNNING_MIN)) return null;
   return Math.max(CF_STOP_FLOOR, runningLevel * CF_STOP_FRACTION);
-}
-
-const STOP_FRACTION = 0.4;   // of the running level
-const STOP_FLOOR = 0.4;      // never arm below this, whatever was measured
-const RUNNING_MIN = 0.8;     // below this the machine was not running to begin with
-
-/* Running level -> the threshold to call it stopped, or null when the warm-up
- * saw nothing moving. Null means do not arm: a detector that learned its
- * baseline from an already-stopped machine would never fire, and would look
- * exactly like one that was working. */
-function stopThresholdFrom(runningLevel) {
-  if (!(runningLevel > RUNNING_MIN)) return null;
-  return Math.max(STOP_FLOOR, runningLevel * STOP_FRACTION);
 }
 
 /* Grey samples inside the ROI's bounding box, subsampled by 2. Not masked to
@@ -702,15 +660,6 @@ function meanAbsDiff(a, b) {
   return s / a.length;
 }
 
-/* Motion of the ROI above and beyond whatever moved the whole frame.
- * Clamped at zero: a negative result means the frame changed more than the
- * ROI did, which is a lighting event, not the machine running backwards. */
-function netMotion(roiNow, roiPrev, gridNow, gridPrev) {
-  const a = meanAbsDiff(roiNow, roiPrev), b = meanAbsDiff(gridNow, gridPrev);
-  if (a === null || b === null) return null;
-  return Math.max(0, a - b);
-}
-
 function downsampleGray(imageData, gw, gh) {
   const { data, width, height } = imageData;
   const out = new Float32Array(gw * gh);
@@ -733,16 +682,15 @@ function downsampleGray(imageData, gw, gh) {
 }
 
 const CV = { GAIN_MIN, CREAM_WARM, BAND_FRACTION, BASELINE_MAX, CEILING_MIN,
-             ASPECT_TOLERANCE, ANALYSIS_MAX, STOP_BELOW, STOP_HOLD,
+             ASPECT_TOLERANCE, ANALYSIS_MAX,
              sampleGray, noiseFloorFor, changedFraction, cfStopThresholdFrom,
              NOISE_PCTL, CF_STOP_FRACTION, CF_STOP_FLOOR, CF_RUNNING_MIN,
-             STOP_FRACTION, STOP_FLOOR, RUNNING_MIN, stopThresholdFrom,
              GAIN_RANGE, CREAM_RANGE,
              warmth, openBinary, largestComponent, principalAxis, percentile, otsu,
              roiWarmthValues, regionFrom, madSigma, creamThresholdFor,
              fitInto, aspectMismatch,
              toRect, rectCorners, measure, calibrate, driftCheck, downsampleGray,
-             roiGray, meanAbsDiff, netMotion };
+             roiGray, meanAbsDiff, };
 
 if (typeof module !== "undefined" && module.exports) module.exports = CV;
 if (typeof window !== "undefined") window.CV = CV;
