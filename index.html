@@ -333,8 +333,47 @@ const SAY_TEXT  = { low: "Bobbin low", stopped: "Machine stopped" };
    the cost of clearing late is only that the screen stays up a moment longer. */
 const RESUME_HOLD = 2;
 
-const MOTION_WARMUP = 10;   // s before stop detection arms — lets AE settle
+/* Stop detection measures a learned set of pixels, not the depletion region.
+ *
+ * The temporal difference is the spatial gradient projected onto the motion:
+ * |I_t - I_t-1| ~ |grad(I) . v|. A wound bobbin seen side-on defeats both
+ * terms at once -- the barrel is low-texture, and rotation about its own axis
+ * carries every point along an iso-contour, so grad(I) is small AND
+ * perpendicular to v. The surface is therefore nearly static to a difference
+ * test however fast it turns, while the rim, with a strong gradient moving
+ * normal to itself, is where all the signal lives.
+ *
+ * Measured on videos/android: the depletion region read 0.2% while running
+ * against 0.5% while stopped -- bands overlapped, so no threshold could have
+ * worked, and the tablet reported a flat 0.0%. The whole frame is worse: it
+ * dilutes the moving pixels with static ones and armed in 17 of 107 attempts.
+ *
+ * So the region is learned instead. During the warm-up every sampled pixel is
+ * counted each time it beats the noise floor, and the ones that beat it often
+ * enough become the motion mask. Selecting the support is what matters, not
+ * its size: separation goes as 1 + s(p1/p0 - 1) for support fraction s, so
+ * every static pixel included drags the ratio toward 1. The winning mask here
+ * is ~640 px, a quarter the size of the depletion region it replaces.
+ *
+ * Frequency, not magnitude, is what keeps a passer-by out of the mask. A mean
+ * has breakdown point zero -- one person crossing the frame for two seconds
+ * inflates their pixels enough to enter a top-N% mask, and when they leave,
+ * those pixels go quiet and the detector reports a stop that never happened.
+ * An exceedance count saturates at 1 per sample however bright the intruder,
+ * so anything moving less than HOT_FRAC of the time is excluded by
+ * construction. Simulated with a crossing figure: 145/145 stops, 0 false.
+ *
+ * Both reasons the warm-up grew to 15s: the estimate of that frequency is a
+ * binomial proportion with SE = sqrt(p(1-p)/N), and at 10s N is only ~14, so
+ * SE ~0.12 against a 0.25 threshold -- a coin flip for marginal pixels. A
+ * fixed-length disturbance also occupies a smaller share of a longer window.
+ * Swept over every start time on the reference clip: 10s armed 95/107 with up
+ * to 30 false alarms, 15s armed 94/97 with none. */
+const MOTION_WARMUP = 15;   // s before stop detection arms — also lets AE settle
 const NOISE_WARMUP = 3;     // s of that spent learning the sensor's noise floor
+const MOTION_STEP = 4;      // whole-frame subsample the mask is selected from
+const HOT_FRAC = 0.25;      // beat the floor this often in warm-up to join the mask
+const MIN_MASK = 50;        // fewer sampled pixels than this and the count is noise
 
 
 const store = {
@@ -365,9 +404,9 @@ let repeatTimers = [], sendsOk = 0, sendsFail = 0;
 let alertKind = null;              // "low" | "stopped" | null — which screen is up
 let faultTimers = [], faultTicker = null, faultFired = false, runStartedAt = 0;
 let faultSends = 0, faultOk = 0, faultFail = 0;
-let prevRoiGray = null, prevGrid = null, quietFor = 0, lastMotion = null;
+let prevGrid = null, quietFor = 0, lastMotion = null;
 let movingFor = 0, stoppedSince = null;
-let warmupMotion = [], stopAt;      // undefined = not decided yet, null = not armed
+let stopAt;                         // undefined = not decided yet, null = not armed
 const clampNum = (v, r) => Math.max(r.min, Math.min(r.max, v || r.def));
 let depEvery = clampNum(+store.get("depEvery", DEP_EVERY.def), DEP_EVERY);
 let stopEvery = clampNum(+store.get("stopEvery", STOP_EVERY.def), STOP_EVERY);
@@ -377,6 +416,8 @@ let sayEvery = { low: clampNum(+store.get("sayLow", SAY_EVERY.low.def), SAY_EVER
                  stopped: clampNum(+store.get("sayStop", SAY_EVERY.stopped.def), SAY_EVERY.stopped) };
 let sayTimer = null;
 let noiseFloor = null, noiseSamples = [], prevFull = null;
+let prevMotion = null, hotCount = null, warmSamples = 0, warmFrames = [];
+let motionMask = null, maskBuf = null, prevMaskBuf = null;
 
 /* ---- setup restore ---------------------------------------------------- */
 $("topic").value = store.get("topic", null) ?? DEFAULT_TOPIC;
@@ -731,9 +772,11 @@ $("reset").onclick = () => {
 function resetRun() {
   clearRepeats(); clearFault();
   faultFired = false; quietFor = 0; movingFor = 0; stoppedSince = null; lastMotion = null;
-  prevRoiGray = prevGrid = null;
-  warmupMotion = []; stopAt = undefined;
+  prevGrid = null;
+  stopAt = undefined;
   noiseFloor = null; noiseSamples = []; prevFull = null;
+  prevMotion = null; hotCount = null; warmSamples = 0; warmFrames = [];
+  motionMask = null; maskBuf = prevMaskBuf = null;
   if (alertKind === "stopped") hideAlertScreen();
   $("faultNote").textContent = ""; $("mMotion").textContent = "";
   window_ = []; clamped = 0; consecutive = 0; fired = false; lastSampleT = -Infinity;
@@ -879,16 +922,26 @@ function loop() {
 }
 
 /* ---- has the unwind bobbin stopped turning? ----------------------------
-   The bobbin turning is the only thing in the ROI that changes, so the same
-   region already being measured for depletion doubles as the motion sensor.
+   The depletion region is the WRONG place to look for motion -- see the note
+   on MOTION_WARMUP for why a rotating barrel is nearly static to a difference
+   test. The motion mask is learned instead, during the warm-up.
 
    What it must not do is cry wolf. A false fault teaches the operator to
    discount the notification, and the same channel carries the depletion
    alert -- so an A2 that nags is a way of disabling A1 without anyone
-   choosing to. Hence a threshold 2.5x below the measured running signal, a
-   ten-second hold, and the suppressions below. */
+   choosing to. Hence a threshold referenced to the SLOW end of the observed
+   running signal, and the suppressions below. */
+/* Copy the masked samples into a reused buffer. Two buffers rather than one
+   because both this frame and the previous one are gathered every sample, and
+   allocating a pair of typed arrays twice a second for the length of a run is
+   garbage the tablet does not need to collect. */
+function gatherMask(src, buf) {
+  for (let i = 0; i < motionMask.length; i++) buf[i] = src[motionMask[i]];
+  return buf;
+}
+
 function checkStopped(img, grid) {
-  const roi = CV.roiGray(img, cal);
+  const motion = CV.sampleGray(img, MOTION_STEP);
   const full = CV.sampleGray(img, 8);
   const age = performance.now() / 1000 - runStartedAt;
 
@@ -899,7 +952,7 @@ function checkStopped(img, grid) {
   if (age < NOISE_WARMUP) {
     const f = CV.noiseFloorFor(full, prevFull);
     if (f !== null) noiseSamples.push(f);
-    prevRoiGray = roi; prevFull = full; prevGrid = grid;
+    prevMotion = motion; prevFull = full; prevGrid = grid;
     $("mMotion").textContent = `calibrating noise · ${Math.ceil(NOISE_WARMUP - age)}s`;
     $("mMotion").style.color = "";
     return;
@@ -909,40 +962,90 @@ function checkStopped(img, grid) {
     noiseFloor = srt.length ? srt[srt.length >> 1] : 8;
   }
 
-  /* Count how many samples changed by more than the floor, rather than
-     averaging how much they all changed. Averaging lets small per-pixel noise
-     accumulate into a floor a stopped machine never gets under: on the Android
-     tablet that floor was 1.4 against a running 4.9, and the two bands
-     overlapped so no threshold separated them. Counting separates them 27x. */
-  const m = CV.changedFraction(roi, prevRoiGray, noiseFloor);
-  prevRoiGray = roi; prevFull = full; prevGrid = grid;
-  if (m === null) return;
-  lastMotion = m;
-
-  /* Phase 2: learn what this camera reads while the machine runs. A static
-     scene reads differently on every device, so no fixed number means "still"
-     on all of them. */
+  /* Phase 2: learn WHICH pixels move and HOW MUCH they move while running.
+     Both are per-device and per-framing, so neither can be a constant. The
+     frames are kept because the running level can only be measured once the
+     mask exists, and the mask is not known until the phase ends. */
   if (age < MOTION_WARMUP) {
-    warmupMotion.push(m);
-    $("mMotion").textContent = `motion ${m.toFixed(1)}% · learning ${Math.ceil(MOTION_WARMUP - age)}s`;
+    if (prevMotion && prevMotion.length === motion.length) {
+      if (hotCount === null) hotCount = new Int32Array(motion.length);
+      for (let k = 0; k < motion.length; k++)
+        if (Math.abs(motion[k] - prevMotion[k]) > noiseFloor) hotCount[k]++;
+      warmSamples++; warmFrames.push(motion);
+    }
+    prevMotion = motion; prevFull = full; prevGrid = grid;
+    $("mMotion").textContent = `learning what moves · ${Math.ceil(MOTION_WARMUP - age)}s`;
     $("mMotion").style.color = "";
     return;
   }
 
   if (stopAt === undefined) {
-    const sorted = [...warmupMotion].sort((a, b) => a - b);
-    const level = sorted.length ? sorted[sorted.length >> 1] : 0;
-    stopAt = CV.cfStopThresholdFrom(level);
-    /* Refusing to arm matters more than it looks. A detector that learned its
-       baseline from an already-stopped machine would never fire again, and
-       would be indistinguishable from one quietly working. */
-    $("faultNote").className = "note" + (stopAt === null ? " warn" : "");
-    $("faultNote").textContent = stopAt === null
-      ? `Stop detection NOT armed — nothing was moving during the first ${MOTION_WARMUP}s ` +
-        `(motion ${level.toFixed(1)}%). Start the machine, then press Reset.`
-      : `Stop detection armed: running at ${level.toFixed(1)}%, noise floor ` +
-        `${noiseFloor.toFixed(0)}, reports stopped below ${stopAt.toFixed(1)}%.`;
+    /* Frequency of exceedance, not average magnitude. A mean has breakdown
+       point zero: one person crossing the frame owns those pixels and the
+       mask follows them off the machine. An indicator saturates at 1. */
+    const idx = [];
+    if (hotCount) for (let k = 0; k < hotCount.length; k++)
+      if (hotCount[k] / warmSamples >= HOT_FRAC) idx.push(k);
+    motionMask = idx.length >= MIN_MASK ? Int32Array.from(idx) : null;
+    if (motionMask) {
+      maskBuf = new Float32Array(motionMask.length);
+      prevMaskBuf = new Float32Array(motionMask.length);
+      const levels = [];
+      /* Two different buffers, or the second gather overwrites the first and
+         every pair compares a frame with itself -- which reads as a dead
+         still machine and arms the detector at zero. */
+      for (let j = 1; j < warmFrames.length; j++)
+        levels.push(CV.changedFraction(gatherMask(warmFrames[j], maskBuf),
+                                       gatherMask(warmFrames[j - 1], prevMaskBuf), noiseFloor));
+      levels.sort((a, b) => a - b);
+      /* The 25th percentile, not the median. The machine's speed varies by
+         design, so the middle of the warm-up says nothing about its slowest
+         running moment -- and the slowest running moment is the thing the
+         threshold must stay under. Measured on the reference clip, this lifts
+         the tightest running-to-threshold margin from 1.41x to 1.65x at no
+         cost in arming or detection. */
+      const level = levels.length
+        ? levels[Math.floor(0.25 * (levels.length - 1))] : 0;
+      stopAt = CV.cfStopThresholdFrom(level);
+      warmFrames = [];                     // several MB at 1280px; it has done its job
+      /* Refusing to arm matters more than it looks. A detector that learned its
+         baseline from an already-stopped machine would never fire again, and
+         would be indistinguishable from one quietly working. */
+      $("faultNote").className = "note" + (stopAt === null ? " warn" : "");
+      $("faultNote").textContent = stopAt === null
+        ? `Stop detection NOT armed — nothing was moving during the first ${MOTION_WARMUP}s ` +
+          `(motion ${level.toFixed(1)}%). Start the machine, then press Reset.`
+        : `Stop detection armed: ${motionMask.length} moving points, running at ` +
+          `${level.toFixed(1)}%, noise floor ${noiseFloor.toFixed(0)}, ` +
+          `reports stopped below ${stopAt.toFixed(1)}%.`;
+    } else {
+      /* Too few moving points is its own diagnosis, and a different one from
+         "nothing moved": it means the camera can see the machine but nothing
+         in view has enough texture to track. Say so rather than blaming the
+         machine for standing still. */
+      stopAt = null;
+      warmFrames = [];
+      $("faultNote").className = "note warn";
+      $("faultNote").textContent =
+        `Stop detection NOT armed — only ${hotCount ? "a few" : "no"} moving points found ` +
+        `in the first ${MOTION_WARMUP}s. Aim the camera so a moving edge is in view, ` +
+        `then press Reset.`;
+    }
   }
+
+  const m = motionMask && prevMotion && prevMotion.length === motion.length
+    ? CV.changedFraction(gatherMask(motion, maskBuf),
+                         gatherMask(prevMotion, prevMaskBuf), noiseFloor)
+    : null;
+  prevMotion = motion; prevFull = full; prevGrid = grid;
+  if (m === null) {
+    if (!motionMask) {
+      $("mMotion").textContent = "stop detection off — no moving points";
+      $("mMotion").style.color = "";
+    }
+    return;
+  }
+  lastMotion = m;
   if (stopAt === null) {
     $("mMotion").textContent = `motion ${m.toFixed(1)}% · stop detection off`;
     return;
@@ -1014,6 +1117,12 @@ function fireFault() {
   if (audio) { const t = audio.currentTime; beep(t, 440, 0.18); beep(t + 0.3, 330, 0.28); }
   showAlertScreen("stopped", "MACHINE STOPPED",
     `The unwind bobbin has stopped turning — go and look.`);
+  /* The depletion path has always called this and the stop path never did, so
+     a machine stop produced two beeps and a silent, static screen -- no spoken
+     announcement, no repeating alarm, no flash -- while ntfy repeated
+     normally. The "Announce every Ns" setting for "stopped" was unreachable
+     for the same reason: nothing ever started the announcer. */
+  startAlarm();
   clearFault();
   faultSends = faultOk = faultFail = 0;
   const since = Date.now();
