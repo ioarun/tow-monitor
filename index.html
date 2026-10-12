@@ -771,6 +771,13 @@ $("reset").onclick = () => {
 
 function resetRun() {
   clearRepeats(); clearFault();
+  /* runStartedAt is the warm-up clock, not a record of when the session began,
+     and clearing the warm-up state without restarting it is the same as
+     deleting it: `age` stays minutes past MOTION_WARMUP, both learning phases
+     are skipped, no mask is ever built, and stop detection refuses for the
+     rest of the session. Reset looked like it worked because depletion
+     tracking does not depend on this clock. */
+  runStartedAt = performance.now() / 1000;
   faultFired = false; quietFor = 0; movingFor = 0; stoppedSince = null; lastMotion = null;
   prevGrid = null;
   stopAt = undefined;
@@ -1046,8 +1053,8 @@ function checkStopped(img, grid) {
       warmFrames = [];
       $("faultNote").className = "note warn";
       $("faultNote").textContent =
-        `Stop detection NOT armed — only ${hotCount ? "a few" : "no"} moving points found ` +
-        `in the first ${MOTION_WARMUP}s. Aim the camera so a moving edge is in view, ` +
+        `Stop detection NOT armed — ${idx.length} moving points found in the first ` +
+        `${MOTION_WARMUP}s, need ${MIN_MASK}. Aim the camera so a moving edge is in view, ` +
         `then press Reset.`;
     }
   }
