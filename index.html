@@ -967,15 +967,27 @@ function checkStopped(img, grid) {
      frames are kept because the running level can only be measured once the
      mask exists, and the mask is not known until the phase ends. */
   if (age < MOTION_WARMUP) {
+    /* The per-sample count is free here -- the loop below already computes it
+       -- and showing it is the difference between diagnosing a refusal and
+       guessing at one. A reading of exactly 0.0 means the two frames were
+       identical, which a live camera never produces: that is a stalled feed,
+       not a still machine, and it looks nothing like a low reading. */
+    let hitsNow = 0;
     if (prevMotion && prevMotion.length === motion.length) {
       if (hotCount === null) hotCount = new Int32Array(motion.length);
       for (let k = 0; k < motion.length; k++)
-        if (Math.abs(motion[k] - prevMotion[k]) > noiseFloor) hotCount[k]++;
+        if (Math.abs(motion[k] - prevMotion[k]) > noiseFloor) { hotCount[k]++; hitsNow++; }
       warmSamples++; warmFrames.push(motion);
     }
     prevMotion = motion; prevFull = full; prevGrid = grid;
-    $("mMotion").textContent = `learning what moves · ${Math.ceil(MOTION_WARMUP - age)}s`;
-    $("mMotion").style.color = "";
+    const live = (100 * hitsNow) / motion.length;
+    /* Labelled "frame" because this is the WHOLE-frame fraction, diluted by
+       every static pixel -- not the masked level that arming is judged on, which
+       runs an order of magnitude higher. It is here to answer one question:
+       are the frames alive? Zero means they are not. */
+    $("mMotion").textContent =
+      `learning · frame changing ${live.toFixed(1)}% · ${Math.ceil(MOTION_WARMUP - age)}s`;
+    $("mMotion").style.color = hitsNow === 0 ? "var(--amber)" : "";
     return;
   }
 
@@ -998,14 +1010,18 @@ function checkStopped(img, grid) {
         levels.push(CV.changedFraction(gatherMask(warmFrames[j], maskBuf),
                                        gatherMask(warmFrames[j - 1], prevMaskBuf), noiseFloor));
       levels.sort((a, b) => a - b);
+      /* The mask is pixels hot in at least HOT_FRAC of samples, so the MEAN
+         per-sample reading cannot be below HOT_FRAC. A q25 under CF_RUNNING_MIN
+         therefore means the window was uneven, not weak -- and the median and
+         peak say by how much, which is the whole diagnosis. */
+      const pick = q => levels.length ? levels[Math.floor(q * (levels.length - 1))] : 0;
       /* The 25th percentile, not the median. The machine's speed varies by
          design, so the middle of the warm-up says nothing about its slowest
          running moment -- and the slowest running moment is the thing the
          threshold must stay under. Measured on the reference clip, this lifts
          the tightest running-to-threshold margin from 1.41x to 1.65x at no
          cost in arming or detection. */
-      const level = levels.length
-        ? levels[Math.floor(0.25 * (levels.length - 1))] : 0;
+      const level = pick(0.25);
       stopAt = CV.cfStopThresholdFrom(level);
       warmFrames = [];                     // several MB at 1280px; it has done its job
       /* Refusing to arm matters more than it looks. A detector that learned its
@@ -1013,8 +1029,11 @@ function checkStopped(img, grid) {
          would be indistinguishable from one quietly working. */
       $("faultNote").className = "note" + (stopAt === null ? " warn" : "");
       $("faultNote").textContent = stopAt === null
-        ? `Stop detection NOT armed — nothing was moving during the first ${MOTION_WARMUP}s ` +
-          `(motion ${level.toFixed(1)}%). Start the machine, then press Reset.`
+        ? `Stop detection NOT armed — ${motionMask.length} moving points found, but the ` +
+          `reading was uneven across the first ${MOTION_WARMUP}s: ` +
+          `quarter ${level.toFixed(1)}%, middle ${pick(0.5).toFixed(1)}%, ` +
+          `best ${pick(1).toFixed(1)}% (floor ${noiseFloor.toFixed(0)}). ` +
+          `Arming needs the quarter mark above ${CV.CF_RUNNING_MIN}%.`
         : `Stop detection armed: ${motionMask.length} moving points, running at ` +
           `${level.toFixed(1)}%, noise floor ${noiseFloor.toFixed(0)}, ` +
           `reports stopped below ${stopAt.toFixed(1)}%.`;
