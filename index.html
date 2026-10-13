@@ -119,6 +119,7 @@
   <span class="spacer"></span>
   <span class="chip" id="calChip">not calibrated</span>
   <span class="chip" id="netChip">ntfy off</span>
+  <span class="chip" id="verChip" title="version · published build"></span>
 </header>
 
 <main>
@@ -257,6 +258,18 @@ const $ = id => document.getElementById(id);
 const vid = $("vid"), ov = $("ov"), octx = ov.getContext("2d");
 const grab = document.createElement("canvas");
 const gctx = grab.getContext("2d", { willReadFrequently: true });
+
+/* VERSION is written by hand and bumped when a release is cut. BUILD is
+   rewritten by the publish workflow with the source commit, exactly as it
+   rewrites the service worker's cache name -- so the two cannot disagree about
+   which code is on the device.
+
+   Both are on screen because "has my refresh actually landed?" has cost real
+   time at the machine more than once: the service worker is cache-first, so a
+   reload can show the old shell while the new one installs behind it. A build
+   string settles that in a glance instead of by hunting for a changed word. */
+const VERSION = "1.0.0";
+const BUILD = "bc933c2";        // rewritten on publish; "dev" means a local checkout
 
 const SAMPLE_S = 0.5;        // seconds between samples, in SOURCE time
 const MEDIAN_WINDOW = 5;     // smooth before the clamp, so one spike cannot ratchet
@@ -1420,6 +1433,8 @@ document.addEventListener("visibilitychange", () => {
   if (running && document.visibilityState === "visible")
     navigator.wakeLock?.request("screen").then(w => wakeLock = w).catch(() => {});
 });
+
+$("verChip").textContent = `v${VERSION}` + (BUILD === "dev" ? " dev" : ` · ${BUILD}`);
 
 if ("serviceWorker" in navigator)
   navigator.serviceWorker.register("sw.js").catch(() => {});
