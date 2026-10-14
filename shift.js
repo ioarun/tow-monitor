@@ -216,8 +216,8 @@ function derive(events, { now = null, missAbovePct = MISS_ABOVE_PCT } = {}) {
       startedAt: from, endedAt: to,
       elapsedSeconds: secs(to - from),
       runSeconds: secs(run),
-      buildIdleSeconds: secs(idle),
-      betweenBobbinsSeconds: secs(between),
+      idleDuringBobbinBuildSeconds: secs(idle),
+      idleAfterBobbinCompleteSeconds: secs(between),
       // a scrap bobbin counts against whichever bobbin it was used up feeding
       scrapBobbins: runs.filter(r => !r.open && r.endedAt > from && r.endedAt <= to).length,
       utilisation: run + idle > 0 ? Math.round((1000 * run) / (run + idle)) / 10 : null,
@@ -242,8 +242,8 @@ function derive(events, { now = null, missAbovePct = MISS_ABOVE_PCT } = {}) {
   bobbins.forEach(b => { b.seq += carried.bobbinsCompleted; });
   if (bobbins.length) {
     bobbins[0].scrapBobbins += carried.scrapBobbins;
-    bobbins[0].buildIdleSeconds = Math.round((bobbins[0].buildIdleSeconds + carried.idleSeconds) * 10) / 10;
-    const r = bobbins[0].runSeconds, i = bobbins[0].buildIdleSeconds;
+    bobbins[0].idleDuringBobbinBuildSeconds = Math.round((bobbins[0].idleDuringBobbinBuildSeconds + carried.idleSeconds) * 10) / 10;
+    const r = bobbins[0].runSeconds, i = bobbins[0].idleDuringBobbinBuildSeconds;
     bobbins[0].utilisation = r + i > 0 ? Math.round((1000 * r) / (r + i)) / 10 : null;
   }
 
@@ -263,11 +263,11 @@ function derive(events, { now = null, missAbovePct = MISS_ABOVE_PCT } = {}) {
       scrapBobbins: closed.length + carried.scrapBobbins,
       carried,
       totalRunSeconds: Math.round(runSec * 10) / 10,
-      buildIdleSeconds: Math.round(idleSec * 10) / 10,
+      idleDuringBobbinBuildSeconds: Math.round(idleSec * 10) / 10,
       utilisation: runSec + idleSec > 0 ? Math.round((1000 * runSec) / (runSec + idleSec)) / 10 : null,
       faultStopCount: sum(runs.map(r => r.faultStops)),
       faultStopSeconds: Math.round(sum(runs.map(r => r.faultStopSeconds)) * 10) / 10,
-      betweenBobbinsSeconds: secs(betweenIn(startedAt, horizon)),
+      idleAfterBobbinCompleteSeconds: secs(betweenIn(startedAt, horizon)),
       missedAlerts: runs.filter(r => r.endedBy === "missed").length,
       abandoned: runs.filter(r => r.endedBy === "abandoned").length,
       medianWarningSeconds: median(warnings),
@@ -291,11 +291,11 @@ function toCSV(runs, shift) {
 
 function bobbinsCSV(bobbins, shift) {
   const cols = ["shift", "shiftName", "completedBobbin", "elapsedSeconds",
-                "runSeconds", "buildIdleSeconds", "betweenBobbinsSeconds", "scrapBobbins",
+                "runSeconds", "idleDuringBobbinBuildSeconds", "idleAfterBobbinCompleteSeconds", "scrapBobbins",
                 "utilisationPct"];
   const rows = bobbins.map(b => [
     shift ? shift.shiftNo : "", shift ? (shift.name ?? "") : "", b.seq,
-    b.elapsedSeconds, b.runSeconds, b.buildIdleSeconds, b.betweenBobbinsSeconds,
+    b.elapsedSeconds, b.runSeconds, b.idleDuringBobbinBuildSeconds, b.idleAfterBobbinCompleteSeconds,
     b.scrapBobbins, b.utilisation ?? ""]);
   return [cols.join(","), ...rows.map(r => r.join(","))].join("\n");
 }
