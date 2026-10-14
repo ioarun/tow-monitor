@@ -33,6 +33,7 @@ const EV = {
   STOP_CLEARED:           "stop.cleared",          // { heldFor }
   BOBBIN_COMPLETED:       "bobbin.completed",      // { peakPct }
   CALIBRATION_APPLIED:    "calibration.applied",   // { baseline, ceiling, creamWarm }
+  CARRIED_OVER:           "carried.over",          // { bobbinsCompleted, scrapBobbins, idleSeconds }
 };
 
 /* A run that ended with no alert is either one we failed to warn about or one
@@ -162,18 +163,75 @@ function derive(events, { now = null, missAbovePct = MISS_ABOVE_PCT } = {}) {
   }
   if (runs.length) runs[runs.length - 1].idleAfterSeconds = null;
 
+  /* Per completed bobbin. A shift finishes as many as it finishes, and the
+     operator wants to know what each one cost -- so the shift is cut at every
+     completion and the motion inside each piece is measured.
+     
+     Cut on the motion timeline rather than on whole runs, because a bobbin
+     usually completes part-way through a scrap bobbin: the run feeding it
+     carries on afterwards and its time belongs to both sides of the line. */
+  const gaps = [];
+  for (let i = 0; i < intervals.length - 1; i++)
+    gaps.push({ start: intervals[i].end, end: intervals[i + 1].start });
+
+  const completions = ev.filter(e => e.type === EV.BOBBIN_COMPLETED);
+  const bobbins = completions.map((c, i) => {
+    const from = i ? completions[i - 1].t : startedAt;
+    const to = c.t;
+    const spans = intervals.map(x => overlap(x, from, to)).filter(Boolean);
+    const mine = gaps.filter(g => g.start >= from && g.start < to);
+    const run = sum(spans.map(x => x.end - x.start));
+    const idle = sum(mine.map(g => g.end - g.start));
+    return {
+      seq: i + 1,
+      startedAt: from, endedAt: to,
+      elapsedSeconds: secs(to - from),
+      runSeconds: secs(run),
+      idleSeconds: secs(idle),
+      // a scrap bobbin counts against whichever bobbin it was used up feeding
+      scrapBobbins: runs.filter(r => !r.open && r.endedAt > from && r.endedAt <= to).length,
+      utilisation: run + idle > 0 ? Math.round((1000 * run) / (run + idle)) / 10 : null,
+    };
+  });
+
+  /* Work already done on the bobbin currently on the rewinder, before this
+     shift opened. A shift often picks up a part-made bobbin, and without this
+     its first completion would report only the fraction done today -- which is
+     the one number on that line nobody could sanity-check against the machine.
+     The operator types it in; the last value entered wins.
+
+     It belongs to the FIRST bobbin completed this shift, because that is the
+     one it was spent on, and to the shift totals. It does not invent runs:
+     `runs` stays a record of what this shift actually saw. */
+  const carriedEv = ev.filter(e => e.type === EV.CARRIED_OVER).pop();
+  const carried = { bobbinsCompleted: carriedEv?.bobbinsCompleted || 0,
+                    scrapBobbins: carriedEv?.scrapBobbins || 0,
+                    idleSeconds: carriedEv?.idleSeconds || 0 };
+  /* Bobbins finished before this shift opened are numbered ahead of the ones
+     finished in it, so the operator's count on screen matches the machine's. */
+  bobbins.forEach(b => { b.seq += carried.bobbinsCompleted; });
+  if (bobbins.length) {
+    bobbins[0].scrapBobbins += carried.scrapBobbins;
+    bobbins[0].idleSeconds = Math.round((bobbins[0].idleSeconds + carried.idleSeconds) * 10) / 10;
+    const r = bobbins[0].runSeconds, i = bobbins[0].idleSeconds;
+    bobbins[0].utilisation = r + i > 0 ? Math.round((1000 * r) / (r + i)) / 10 : null;
+  }
+
   const closed = runs.filter(r => !r.open);
   const warnings = runs.map(r => r.warningSeconds).filter(x => x !== null);
   const runSec = sum(runs.map(r => r.runSeconds));
-  const idleSec = sum(runs.map(r => r.idleAfterSeconds || 0)) + sum(runs.map(r => r.faultStopSeconds));
+  const idleSec = sum(runs.map(r => r.idleAfterSeconds || 0))
+                + sum(runs.map(r => r.faultStopSeconds)) + carried.idleSeconds;
 
   return {
     shift: {
       shiftNo: started ? started.shiftNo : null,
       name: started ? (started.name ?? null) : null,
       startedAt, endedAt,
-      bobbinsCompleted: ev.filter(e => e.type === EV.BOBBIN_COMPLETED).length,
-      scrapBobbins: closed.length,
+      bobbinsCompleted: ev.filter(e => e.type === EV.BOBBIN_COMPLETED).length
+                        + (ev.filter(e => e.type === EV.CARRIED_OVER).pop()?.bobbinsCompleted || 0),
+      scrapBobbins: closed.length + carried.scrapBobbins,
+      carried,
       totalRunSeconds: Math.round(runSec * 10) / 10,
       totalIdleSeconds: Math.round(idleSec * 10) / 10,
       utilisation: runSec + idleSec > 0 ? Math.round((1000 * runSec) / (runSec + idleSec)) / 10 : null,
@@ -183,6 +241,7 @@ function derive(events, { now = null, missAbovePct = MISS_ABOVE_PCT } = {}) {
       abandoned: runs.filter(r => r.endedBy === "abandoned").length,
       medianWarningSeconds: median(warnings),
     },
+    bobbins,
     runs,
   };
 }
@@ -196,6 +255,15 @@ function toCSV(runs, shift) {
     r.seq, r.runSeconds, r.idleAfterSeconds ?? "",
     r.peakPct ?? "", r.warningSeconds ?? "", r.ackSeconds ?? "", r.endedBy,
     r.faultStops, r.faultStopSeconds]);
+  return [cols.join(","), ...rows.map(r => r.join(","))].join("\n");
+}
+
+function bobbinsCSV(bobbins, shift) {
+  const cols = ["shift", "shiftName", "completedBobbin", "elapsedSeconds",
+                "runSeconds", "idleSeconds", "scrapBobbins", "utilisationPct"];
+  const rows = bobbins.map(b => [
+    shift ? shift.shiftNo : "", shift ? (shift.name ?? "") : "", b.seq,
+    b.elapsedSeconds, b.runSeconds, b.idleSeconds, b.scrapBobbins, b.utilisation ?? ""]);
   return [cols.join(","), ...rows.map(r => r.join(","))].join("\n");
 }
 
@@ -215,7 +283,7 @@ function createLog(shiftNo) {
   };
 }
 
-const Shift = { EV, MISS_ABOVE_PCT, derive, toCSV, createLog, motionIntervals };
+const Shift = { EV, MISS_ABOVE_PCT, derive, toCSV, bobbinsCSV, createLog, motionIntervals };
 
 if (typeof module !== "undefined" && module.exports) module.exports = Shift;
 if (typeof window !== "undefined") window.Shift = Shift;

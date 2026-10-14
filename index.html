@@ -105,6 +105,14 @@
                border:0; border-bottom:1px dashed var(--rule); padding:0 2px 1px;
                width:5.2em; font-family:inherit; letter-spacing:-.01em; }
   .shiftName:focus { outline:none; border-bottom-color:var(--accent); }
+  /* Editable, because a shift often picks up a part-made bobbin and the
+     counters have to start where the machine actually is. Typing a figure sets
+     what was carried in; the app counts up from there. */
+  .tally .num { font-size:15px; color:var(--ink); background:transparent; border:0;
+                border-bottom:1px dashed var(--rule); padding:0 2px 1px; width:2.4em;
+                font-family:inherit; letter-spacing:-.01em; text-align:right; }
+  .tally .num.wide { width:3.6em; }
+  .tally .num:focus { outline:none; border-bottom-color:var(--accent); }
   .hidden { display:none !important; }
 
   /* The alert takes the whole screen. A tablet propped by a machine is read
@@ -153,9 +161,9 @@
     <div class="tally" id="tally">
       <span><input id="tShift" class="shiftName" spellcheck="false"
                    autocomplete="off" maxlength="12">shift</span>
-      <span><b id="tScrap">0</b>scrap bobbins used</span>
-      <span><b id="tDone">0</b>completed</span>
-      <span><b id="tIdle">0:00</b>idle</span>
+      <span><input id="tScrap" class="num" inputmode="numeric">scrap bobbins used</span>
+      <span><input id="tDone" class="num" inputmode="numeric">completed</span>
+      <span><input id="tIdle" class="num wide" inputmode="numeric">idle</span>
     </div>
     <div class="meta">
       <span id="mState">idle</span>
@@ -295,7 +303,7 @@ const gctx = grab.getContext("2d", { willReadFrequently: true });
    reload can show the old shell while the new one installs behind it. A build
    string settles that in a glance instead of by hunting for a changed word. */
 const VERSION = "1.0.0";
-const BUILD = "5335e36";        // rewritten on publish; "dev" means a local checkout
+const BUILD = "307f582";        // rewritten on publish; "dev" means a local checkout
 
 const SAMPLE_S = 0.5;        // seconds between samples, in SOURCE time
 const MEDIAN_WINDOW = 5;     // smooth before the clamp, so one spike cannot ratchet
@@ -919,6 +927,7 @@ async function startRun() {
     log = Shift.createLog(shiftNo);
     log.add(Shift.EV.SHIFT_STARTED, { shiftNo, name: $("tShift").value.trim() || "Arvo" });
     machineMoving = false;
+    if (pendingCarry) log.add(Shift.EV.CARRIED_OVER, pendingCarry);
     if (cal) log.add(Shift.EV.CALIBRATION_APPLIED,
       { baseline: cal.baselinePct ?? null, ceiling: cal.ceilingPct ?? null,
         creamWarm: cal.creamWarm ?? null });
@@ -1522,17 +1531,75 @@ const SHIFT_KEEP = 4;                   // completed shifts held on the tablet
 $("tShift").value = store.get("shiftName", "Arvo");
 $("tShift").oninput = () => store.set("shiftName", $("tShift").value.trim() || "Arvo");
 
+/* "15" and "15:00" both mean a quarter of an hour. Operators write both, and
+   refusing one of them at the start of a shift would be a silly place to be
+   strict. */
+function parseMins(text) {
+  const t = String(text).trim();
+  if (!t) return 0;
+  const [a, b] = t.split(":");
+  return b === undefined ? Math.max(0, +a || 0) * 60
+                         : Math.max(0, +a || 0) * 60 + Math.max(0, +b || 0);
+}
+
+/* What was already on the machine when this shift opened. Carried values are
+   kept as an event so they are part of the record and can be corrected later;
+   the last one entered wins. Typed before Start, they are held until there is
+   a log to put them in. */
+let pendingCarry = store.get("carry", null);
+
+function carryNow() {
+  const derived = log ? log.derive({ now: Date.now() }) : null;
+  const base = derived ? derived.shift.carried : (pendingCarry || {});
+  return { bobbinsCompleted: base.bobbinsCompleted || 0,
+           scrapBobbins: base.scrapBobbins || 0,
+           idleSeconds: base.idleSeconds || 0 };
+}
+
+/* Typing sets the displayed total, so the carry is whatever makes the sum come
+   out right -- the operator should not have to work out the difference. */
+function setCarryFromFields() {
+  const shown = {
+    bobbinsCompleted: Math.max(0, parseInt($("tDone").value, 10) || 0),
+    scrapBobbins: Math.max(0, parseInt($("tScrap").value, 10) || 0),
+    idleSeconds: parseMins($("tIdle").value),
+  };
+  /* What this shift has counted on its own, with any existing carry taken back
+     out. Before Start there is no shift, so that is simply zero -- subtracting
+     a carry from a total that never included it adds it a second time, which
+     turned 17 into 51 the first time this ran. */
+  const cur = carryNow();
+  const d = log ? log.derive({ now: Date.now() }).shift : null;
+  const own = d ? {
+    bobbinsCompleted: d.bobbinsCompleted - cur.bobbinsCompleted,
+    scrapBobbins: d.scrapBobbins - cur.scrapBobbins,
+    idleSeconds: d.totalIdleSeconds - cur.idleSeconds,
+  } : { bobbinsCompleted: 0, scrapBobbins: 0, idleSeconds: 0 };
+  const carry = {
+    bobbinsCompleted: Math.max(0, shown.bobbinsCompleted - own.bobbinsCompleted),
+    scrapBobbins: Math.max(0, shown.scrapBobbins - own.scrapBobbins),
+    idleSeconds: Math.max(0, shown.idleSeconds - own.idleSeconds),
+  };
+  if (log) log.add(Shift.EV.CARRIED_OVER, carry);
+  else { pendingCarry = carry; store.set("carry", carry); }
+}
+["tScrap", "tDone", "tIdle"].forEach(id => { $(id).onchange = setCarryFromFields; });
+
 function paintTally() {
+  const focused = document.activeElement;
+  const set = (id, v) => { if ($(id) !== focused) $(id).value = v; };
   if (!log) {
-    $("tScrap").textContent = "0"; $("tDone").textContent = "0";
-    $("tIdle").textContent = "0:00";
+    const c = pendingCarry || {};
+    set("tScrap", c.scrapBobbins || 0);
+    set("tDone", c.bobbinsCompleted || 0);
+    set("tIdle", mmss(c.idleSeconds || 0));
     $("tShift").disabled = false;
     return;
   }
   const { shift } = log.derive({ now: Date.now() });
-  $("tScrap").textContent = shift.scrapBobbins;
-  $("tDone").textContent = shift.bobbinsCompleted;
-  $("tIdle").textContent = mmss(shift.totalIdleSeconds);
+  set("tScrap", shift.scrapBobbins);
+  set("tDone", shift.bobbinsCompleted);
+  set("tIdle", mmss(shift.totalIdleSeconds));
   $("tShift").disabled = true;          // named at the start, fixed for the shift
 }
 setInterval(() => { if (log) paintTally(); }, 2000);
@@ -1548,11 +1615,14 @@ function savedShifts() {
 $("bobbinDone").onclick = () => {
   if (!log) return;
   log.add(Shift.EV.BOBBIN_COMPLETED);
-  const { shift } = log.derive({ now: Date.now() });
+  const { shift, bobbins } = log.derive({ now: Date.now() });
+  const b = bobbins[bobbins.length - 1];
   paintTally();
   $("sessionNote").className = "note ok";
   $("sessionNote").textContent =
-    `Bobbin ${shift.bobbinsCompleted} completed this shift, from ${shift.scrapBobbins + 1} scrap bobbins so far.`;
+    `Bobbin ${b.seq} completed — ${b.scrapBobbins} scrap bobbin${b.scrapBobbins === 1 ? "" : "s"}, ` +
+    `${mmss(b.runSeconds)} running, ${mmss(b.idleSeconds)} idle` +
+    (b.utilisation !== null ? ` (${b.utilisation}% used).` : ".");
 };
 
 /* End closes the shift and files it. Only this button does -- switching source
@@ -1566,6 +1636,7 @@ function endShift() {
     const kept = [...savedShifts(), { events: log.events, summary: shift }].slice(-SHIFT_KEEP);
     store.set("shifts", kept);
     log = null; machineMoving = false;
+    pendingCarry = null; store.set("carry", null);
     $("bobbinDone").disabled = true;
     $("sessionNote").className = "note ok";
     $("sessionNote").textContent =
@@ -1587,13 +1658,14 @@ $("exportBtn").onclick = () => {
     $("sessionNote").textContent = "Nothing recorded yet.";
     return;
   }
-  const rows = bundle.flatMap(b => {
-    const d = Shift.derive(b.events, { now: Date.now() });
-    return Shift.toCSV(d.runs, d.shift).split("\n").slice(1);
-  });
+  const derived = bundle.map(b => Shift.derive(b.events, { now: Date.now() }));
+  const rows = derived.flatMap(d => Shift.toCSV(d.runs, d.shift).split("\n").slice(1));
+  const bRows = derived.flatMap(d => Shift.bobbinsCSV(d.bobbins, d.shift).split("\n").slice(1));
   const header = Shift.toCSV([], null).split("\n")[0];
+  const bHeader = Shift.bobbinsCSV([], null).split("\n")[0];
   const stamp = new Date().toISOString().slice(0, 16).replace(/[:T]/g, "-");
-  download(`tow-shifts-${stamp}.csv`, [header, ...rows].join("\n"), "text/csv");
+  download(`tow-scrap-bobbins-${stamp}.csv`, [header, ...rows].join("\n"), "text/csv");
+  if (bRows.length) download(`tow-bobbins-${stamp}.csv`, [bHeader, ...bRows].join("\n"), "text/csv");
   download(`tow-shifts-${stamp}.json`, JSON.stringify(bundle, null, 1), "application/json");
   $("sessionNote").className = "note ok";
   $("sessionNote").textContent = `Exported ${bundle.length} shift${bundle.length > 1 ? "s" : ""}.`;
