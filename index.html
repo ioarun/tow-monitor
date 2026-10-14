@@ -306,7 +306,7 @@ const gctx = grab.getContext("2d", { willReadFrequently: true });
    reload can show the old shell while the new one installs behind it. A build
    string settles that in a glance instead of by hunting for a changed word. */
 const VERSION = "1.0.0";
-const BUILD = "e79d398";        // rewritten on publish; "dev" means a local checkout
+const BUILD = "f1b27dd";        // rewritten on publish; "dev" means a local checkout
 
 const SAMPLE_S = 0.5;        // seconds between samples, in SOURCE time
 const MEDIAN_WINDOW = 5;     // smooth before the clamp, so one spike cannot ratchet
@@ -1615,7 +1615,7 @@ function setCarryFromFields() {
   const own = d ? {
     bobbinsCompleted: d.bobbinsCompleted - cur.bobbinsCompleted,
     scrapBobbins: d.scrapBobbins - cur.scrapBobbins,
-    idleSeconds: d.totalIdleSeconds - cur.idleSeconds,
+    idleSeconds: d.buildIdleSeconds - cur.idleSeconds,
   } : { bobbinsCompleted: 0, scrapBobbins: 0, idleSeconds: 0 };
   const carry = {
     bobbinsCompleted: Math.max(0, shown.bobbinsCompleted - own.bobbinsCompleted),
@@ -1641,7 +1641,7 @@ function paintTally() {
   const { shift } = log.derive({ now: Date.now() });
   set("tScrap", shift.scrapBobbins);
   set("tDone", shift.bobbinsCompleted);
-  set("tIdle", mmss(shift.totalIdleSeconds));
+  set("tIdle", mmss(shift.buildIdleSeconds));
   $("tShift").disabled = true;          // named at the start, fixed for the shift
 }
 setInterval(() => { if (log) paintTally(); }, 2000);
@@ -1663,7 +1663,7 @@ $("bobbinDone").onclick = () => {
   $("sessionNote").className = "note ok";
   $("sessionNote").textContent =
     `Bobbin ${b.seq} completed — ${b.scrapBobbins} scrap bobbin${b.scrapBobbins === 1 ? "" : "s"}, ` +
-    `${mmss(b.runSeconds)} running, ${mmss(b.idleSeconds)} idle` +
+    `${mmss(b.runSeconds)} running, ${mmss(b.buildIdleSeconds)} idle` +
     (b.utilisation !== null ? ` (${b.utilisation}% used).` : ".");
 };
 
@@ -1684,8 +1684,8 @@ function endShift() {
     $("sessionNote").textContent =
       `Shift "${shift.name}" ended — ${shift.bobbinsCompleted} bobbin${shift.bobbinsCompleted === 1 ? "" : "s"} ` +
       `completed, ${shift.scrapBobbins} scrap bobbins used, ${mmss(shift.totalRunSeconds)} running, ` +
-      `${mmss(shift.totalIdleSeconds)} idle` +
-      (shift.changeoverSeconds > 0 ? `, ${mmss(shift.changeoverSeconds)} changing bobbins.` : ".");
+      `${mmss(shift.buildIdleSeconds)} idle` +
+      (shift.betweenBobbinsSeconds > 0 ? `, ${mmss(shift.betweenBobbinsSeconds)} between bobbins.` : ".");
   }
   stopRun();
   updateStart();

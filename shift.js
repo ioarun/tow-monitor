@@ -111,11 +111,14 @@ function derive(events, { now = null, missAbovePct = MISS_ABOVE_PCT } = {}) {
   const intervals = motionIntervals(ev, horizon);
   const closers = ev.filter(e => CLOSERS.includes(e.type));
 
-  /* Changeover: the stopped stretch between a bobbin being finished and the
-     machine turning again. The operator is lifting a full bobbin off the
-     rewinder, fitting a bare tube and re-threading -- stopped, but not waiting.
-     Counting it as idle would make a shift look worse the more bobbins it
-     finished, which is exactly backwards.
+  /* Time when NO bobbin is being made: from one being finished until the
+     machine turns again on the next. Changing the bobbin over is part of it,
+     and so is a forty-minute break before anyone comes back to start another.
+
+     Kept apart from idle because idle means the machine stopped while a bobbin
+     was being built -- a fault, or a scrap bobbin swap -- and that is a
+     different question from how long the line stood between bobbins. Lumping
+     them together made a shift look worse the more bobbins it finished.
 
      It only exists if the machine was ALREADY STOPPED when the bobbin was
      called complete. An earlier version ran the window from the completion to
@@ -129,16 +132,16 @@ function derive(events, { now = null, missAbovePct = MISS_ABOVE_PCT } = {}) {
   for (let i = 0; i < intervals.length - 1; i++)
     stoppedGaps.push({ start: intervals[i].end, end: intervals[i + 1].start });
 
-  const changeovers = [];
+  const betweenBobbins = [];
   for (const c of ev.filter(e => e.type === EV.BOBBIN_COMPLETED)) {
     const during = stoppedGaps.find(g => c.t >= g.start && c.t < g.end);
-    if (during) changeovers.push({ start: c.t, end: during.end });
+    if (during) betweenBobbins.push({ start: c.t, end: during.end });
   }
-  const changeoverIn = (from, to) =>
-    sum(changeovers.map(c => { const o = overlap(c, from, to); return o ? o.end - o.start : 0; }));
+  const betweenIn = (from, to) =>
+    sum(betweenBobbins.map(c => { const o = overlap(c, from, to); return o ? o.end - o.start : 0; }));
 
-  // a stopped stretch, with any changeover taken out of it
-  const netGap = (from, to) => Math.max(0, (to - from) - changeoverIn(from, to));
+  // a stopped stretch, with any between-bobbins time taken out of it
+  const netGap = (from, to) => Math.max(0, (to - from) - betweenIn(from, to));
 
   /* One run per closer, plus a trailing open run if the shift is still going.
    * Runs are cut on the motion timeline; the closers only say where. */
@@ -207,14 +210,14 @@ function derive(events, { now = null, missAbovePct = MISS_ABOVE_PCT } = {}) {
     const mine = stoppedGaps.filter(g => g.start >= from && g.start < to);
     const run = sum(spans.map(x => x.end - x.start));
     const idle = sum(mine.map(g => netGap(g.start, g.end)));
-    const change = changeoverIn(from, to);
+    const between = betweenIn(from, to);
     return {
       seq: i + 1,
       startedAt: from, endedAt: to,
       elapsedSeconds: secs(to - from),
       runSeconds: secs(run),
-      idleSeconds: secs(idle),
-      changeoverSeconds: secs(change),
+      buildIdleSeconds: secs(idle),
+      betweenBobbinsSeconds: secs(between),
       // a scrap bobbin counts against whichever bobbin it was used up feeding
       scrapBobbins: runs.filter(r => !r.open && r.endedAt > from && r.endedAt <= to).length,
       utilisation: run + idle > 0 ? Math.round((1000 * run) / (run + idle)) / 10 : null,
@@ -239,8 +242,8 @@ function derive(events, { now = null, missAbovePct = MISS_ABOVE_PCT } = {}) {
   bobbins.forEach(b => { b.seq += carried.bobbinsCompleted; });
   if (bobbins.length) {
     bobbins[0].scrapBobbins += carried.scrapBobbins;
-    bobbins[0].idleSeconds = Math.round((bobbins[0].idleSeconds + carried.idleSeconds) * 10) / 10;
-    const r = bobbins[0].runSeconds, i = bobbins[0].idleSeconds;
+    bobbins[0].buildIdleSeconds = Math.round((bobbins[0].buildIdleSeconds + carried.idleSeconds) * 10) / 10;
+    const r = bobbins[0].runSeconds, i = bobbins[0].buildIdleSeconds;
     bobbins[0].utilisation = r + i > 0 ? Math.round((1000 * r) / (r + i)) / 10 : null;
   }
 
@@ -260,11 +263,11 @@ function derive(events, { now = null, missAbovePct = MISS_ABOVE_PCT } = {}) {
       scrapBobbins: closed.length + carried.scrapBobbins,
       carried,
       totalRunSeconds: Math.round(runSec * 10) / 10,
-      totalIdleSeconds: Math.round(idleSec * 10) / 10,
+      buildIdleSeconds: Math.round(idleSec * 10) / 10,
       utilisation: runSec + idleSec > 0 ? Math.round((1000 * runSec) / (runSec + idleSec)) / 10 : null,
       faultStopCount: sum(runs.map(r => r.faultStops)),
       faultStopSeconds: Math.round(sum(runs.map(r => r.faultStopSeconds)) * 10) / 10,
-      changeoverSeconds: secs(changeoverIn(startedAt, horizon)),
+      betweenBobbinsSeconds: secs(betweenIn(startedAt, horizon)),
       missedAlerts: runs.filter(r => r.endedBy === "missed").length,
       abandoned: runs.filter(r => r.endedBy === "abandoned").length,
       medianWarningSeconds: median(warnings),
@@ -288,11 +291,11 @@ function toCSV(runs, shift) {
 
 function bobbinsCSV(bobbins, shift) {
   const cols = ["shift", "shiftName", "completedBobbin", "elapsedSeconds",
-                "runSeconds", "idleSeconds", "changeoverSeconds", "scrapBobbins",
+                "runSeconds", "buildIdleSeconds", "betweenBobbinsSeconds", "scrapBobbins",
                 "utilisationPct"];
   const rows = bobbins.map(b => [
     shift ? shift.shiftNo : "", shift ? (shift.name ?? "") : "", b.seq,
-    b.elapsedSeconds, b.runSeconds, b.idleSeconds, b.changeoverSeconds,
+    b.elapsedSeconds, b.runSeconds, b.buildIdleSeconds, b.betweenBobbinsSeconds,
     b.scrapBobbins, b.utilisation ?? ""]);
   return [cols.join(","), ...rows.map(r => r.join(","))].join("\n");
 }
