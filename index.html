@@ -303,7 +303,7 @@ const gctx = grab.getContext("2d", { willReadFrequently: true });
    reload can show the old shell while the new one installs behind it. A build
    string settles that in a glance instead of by hunting for a changed word. */
 const VERSION = "1.0.0";
-const BUILD = "307f582";        // rewritten on publish; "dev" means a local checkout
+const BUILD = "7820683";        // rewritten on publish; "dev" means a local checkout
 
 const SAMPLE_S = 0.5;        // seconds between samples, in SOURCE time
 const MEDIAN_WINDOW = 5;     // smooth before the clamp, so one spike cannot ratchet
@@ -1642,7 +1642,8 @@ function endShift() {
     $("sessionNote").textContent =
       `Shift "${shift.name}" ended — ${shift.bobbinsCompleted} bobbin${shift.bobbinsCompleted === 1 ? "" : "s"} ` +
       `completed, ${shift.scrapBobbins} scrap bobbins used, ${mmss(shift.totalRunSeconds)} running, ` +
-      `${mmss(shift.totalIdleSeconds)} idle.`;
+      `${mmss(shift.totalIdleSeconds)} idle` +
+      (shift.changeoverSeconds > 0 ? `, ${mmss(shift.changeoverSeconds)} changing bobbins.` : ".");
   }
   stopRun();
   updateStart();

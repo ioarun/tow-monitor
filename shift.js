@@ -111,6 +111,35 @@ function derive(events, { now = null, missAbovePct = MISS_ABOVE_PCT } = {}) {
   const intervals = motionIntervals(ev, horizon);
   const closers = ev.filter(e => CLOSERS.includes(e.type));
 
+  /* Changeover: the stopped stretch between a bobbin being finished and the
+     machine turning again. The operator is lifting a full bobbin off the
+     rewinder, fitting a bare tube and re-threading -- stopped, but not waiting.
+     Counting it as idle would make a shift look worse the more bobbins it
+     finished, which is exactly backwards.
+
+     It only exists if the machine was ALREADY STOPPED when the bobbin was
+     called complete. An earlier version ran the window from the completion to
+     the next Reset, which on a completion pressed mid-run swallowed every fault
+     stop in between and zeroed the shift's idle time. If the machine is still
+     turning, nothing is being changed over yet.
+
+     Reported separately rather than discarded: time the machine spent stopped
+     has to land somewhere, or the figures stop adding up to the shift. */
+  const stoppedGaps = [];
+  for (let i = 0; i < intervals.length - 1; i++)
+    stoppedGaps.push({ start: intervals[i].end, end: intervals[i + 1].start });
+
+  const changeovers = [];
+  for (const c of ev.filter(e => e.type === EV.BOBBIN_COMPLETED)) {
+    const during = stoppedGaps.find(g => c.t >= g.start && c.t < g.end);
+    if (during) changeovers.push({ start: c.t, end: during.end });
+  }
+  const changeoverIn = (from, to) =>
+    sum(changeovers.map(c => { const o = overlap(c, from, to); return o ? o.end - o.start : 0; }));
+
+  // a stopped stretch, with any changeover taken out of it
+  const netGap = (from, to) => Math.max(0, (to - from) - changeoverIn(from, to));
+
   /* One run per closer, plus a trailing open run if the shift is still going.
    * Runs are cut on the motion timeline; the closers only say where. */
   const cuts = closers.map(c => ({ closer: c, ...boundary(c, intervals) }));
@@ -129,7 +158,7 @@ function derive(events, { now = null, missAbovePct = MISS_ABOVE_PCT } = {}) {
     /* Every motion gap inside a run is the machine stopping and being
      * restarted on the same bobbin -- a tow-width fault, in practice. The run's
      * own final stop is not one of them. */
-    const faultGaps = spans.slice(0, -1).map((s, i) => spans[i + 1].start - s.end);
+    const faultGaps = spans.slice(0, -1).map((s, i) => netGap(s.end, spans[i + 1].start));
 
     return {
       seq: runs.length + 1,
@@ -159,7 +188,7 @@ function derive(events, { now = null, missAbovePct = MISS_ABOVE_PCT } = {}) {
   // idle is the gap between one run's last motion and the next run's first
   for (let i = 0; i < runs.length - 1; i++) {
     const next = intervals.find(x => x.start >= runs[i].endedAt);
-    runs[i].idleAfterSeconds = next ? secs(next.start - runs[i].endedAt) : null;
+    runs[i].idleAfterSeconds = next ? secs(netGap(runs[i].endedAt, next.start)) : null;
   }
   if (runs.length) runs[runs.length - 1].idleAfterSeconds = null;
 
@@ -170,24 +199,22 @@ function derive(events, { now = null, missAbovePct = MISS_ABOVE_PCT } = {}) {
      Cut on the motion timeline rather than on whole runs, because a bobbin
      usually completes part-way through a scrap bobbin: the run feeding it
      carries on afterwards and its time belongs to both sides of the line. */
-  const gaps = [];
-  for (let i = 0; i < intervals.length - 1; i++)
-    gaps.push({ start: intervals[i].end, end: intervals[i + 1].start });
-
   const completions = ev.filter(e => e.type === EV.BOBBIN_COMPLETED);
   const bobbins = completions.map((c, i) => {
     const from = i ? completions[i - 1].t : startedAt;
     const to = c.t;
     const spans = intervals.map(x => overlap(x, from, to)).filter(Boolean);
-    const mine = gaps.filter(g => g.start >= from && g.start < to);
+    const mine = stoppedGaps.filter(g => g.start >= from && g.start < to);
     const run = sum(spans.map(x => x.end - x.start));
-    const idle = sum(mine.map(g => g.end - g.start));
+    const idle = sum(mine.map(g => netGap(g.start, g.end)));
+    const change = changeoverIn(from, to);
     return {
       seq: i + 1,
       startedAt: from, endedAt: to,
       elapsedSeconds: secs(to - from),
       runSeconds: secs(run),
       idleSeconds: secs(idle),
+      changeoverSeconds: secs(change),
       // a scrap bobbin counts against whichever bobbin it was used up feeding
       scrapBobbins: runs.filter(r => !r.open && r.endedAt > from && r.endedAt <= to).length,
       utilisation: run + idle > 0 ? Math.round((1000 * run) / (run + idle)) / 10 : null,
@@ -237,6 +264,7 @@ function derive(events, { now = null, missAbovePct = MISS_ABOVE_PCT } = {}) {
       utilisation: runSec + idleSec > 0 ? Math.round((1000 * runSec) / (runSec + idleSec)) / 10 : null,
       faultStopCount: sum(runs.map(r => r.faultStops)),
       faultStopSeconds: Math.round(sum(runs.map(r => r.faultStopSeconds)) * 10) / 10,
+      changeoverSeconds: secs(changeoverIn(startedAt, horizon)),
       missedAlerts: runs.filter(r => r.endedBy === "missed").length,
       abandoned: runs.filter(r => r.endedBy === "abandoned").length,
       medianWarningSeconds: median(warnings),
@@ -260,10 +288,12 @@ function toCSV(runs, shift) {
 
 function bobbinsCSV(bobbins, shift) {
   const cols = ["shift", "shiftName", "completedBobbin", "elapsedSeconds",
-                "runSeconds", "idleSeconds", "scrapBobbins", "utilisationPct"];
+                "runSeconds", "idleSeconds", "changeoverSeconds", "scrapBobbins",
+                "utilisationPct"];
   const rows = bobbins.map(b => [
     shift ? shift.shiftNo : "", shift ? (shift.name ?? "") : "", b.seq,
-    b.elapsedSeconds, b.runSeconds, b.idleSeconds, b.scrapBobbins, b.utilisation ?? ""]);
+    b.elapsedSeconds, b.runSeconds, b.idleSeconds, b.changeoverSeconds,
+    b.scrapBobbins, b.utilisation ?? ""]);
   return [cols.join(","), ...rows.map(r => r.join(","))].join("\n");
 }
 
