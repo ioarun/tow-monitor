@@ -92,6 +92,19 @@
   .thumb { flex:1; min-width:0; width:50%; aspect-ratio:16/9; border-radius:6px;
            border:1px dashed var(--rule); background:#0b1115; }
   .thumb.has { border-style:solid; border-color:var(--cyan); }
+  /* The operator's three numbers, in the zone they already watch. Small,
+     because they are context for the big reading above, not competition. */
+  .tally { display:flex; gap:18px; margin:2px 0 8px; flex-wrap:wrap; }
+  .tally span { font-size:11px; color:var(--dim); letter-spacing:.04em;
+                text-transform:uppercase; display:flex; align-items:baseline; gap:5px; }
+  .tally b { font-size:15px; color:var(--ink); letter-spacing:-.01em; }
+  /* The shift is a name the operator types, not a number we allocate -- the
+     words that mean something here are theirs ("Arvo", "Night"), and an index
+     would make them translate every time they looked at it. */
+  .shiftName { font-size:15px; color:var(--ink); background:transparent;
+               border:0; border-bottom:1px dashed var(--rule); padding:0 2px 1px;
+               width:5.2em; font-family:inherit; letter-spacing:-.01em; }
+  .shiftName:focus { outline:none; border-bottom-color:var(--accent); }
   .hidden { display:none !important; }
 
   /* The alert takes the whole screen. A tablet propped by a machine is read
@@ -137,6 +150,13 @@
     <div class="lbl">core exposed</div>
     <div class="pct" id="pct">—</div>
     <div class="bar"><i id="fill"></i></div>
+    <div class="tally" id="tally">
+      <span><input id="tShift" class="shiftName" spellcheck="false"
+                   autocomplete="off" maxlength="12">shift</span>
+      <span><b id="tScrap">0</b>scrap bobbins used</span>
+      <span><b id="tDone">0</b>completed</span>
+      <span><b id="tIdle">0:00</b>idle</span>
+    </div>
     <div class="meta">
       <span id="mState">idle</span>
       <span id="mThr">—</span>
@@ -189,6 +209,11 @@
         <button id="faultBtn">Stop detection</button>
       </div>
       <p class="note" id="faultNote"></p>
+      <div class="row">
+        <button id="bobbinDone" disabled>Bobbin complete</button>
+        <button id="exportBtn">Export data</button>
+      </div>
+      <p class="note" id="sessionNote"></p>
     </section>
 
     <section>
@@ -253,6 +278,7 @@
 </div>
 
 <script src="cv.js"></script>
+<script src="shift.js"></script>
 <script>
 const $ = id => document.getElementById(id);
 const vid = $("vid"), ov = $("ov"), octx = ov.getContext("2d");
@@ -269,7 +295,7 @@ const gctx = grab.getContext("2d", { willReadFrequently: true });
    reload can show the old shell while the new one installs behind it. A build
    string settles that in a glance instead of by hunting for a changed word. */
 const VERSION = "1.0.0";
-const BUILD = "bc933c2";        // rewritten on publish; "dev" means a local checkout
+const BUILD = "5335e36";        // rewritten on publish; "dev" means a local checkout
 
 const SAMPLE_S = 0.5;        // seconds between samples, in SOURCE time
 const MEDIAN_WINDOW = 5;     // smooth before the clamp, so one spike cannot ratchet
@@ -429,6 +455,8 @@ let sayEvery = { low: clampNum(+store.get("sayLow", SAY_EVERY.low.def), SAY_EVER
                  stopped: clampNum(+store.get("sayStop", SAY_EVERY.stopped.def), SAY_EVERY.stopped) };
 let sayTimer = null;
 let noiseFloor = null, noiseSamples = [], prevFull = null;
+let log = null, shiftNo = +(store.get("shiftNo", 0)) || 0;
+let machineMoving = false;        // the recorded state, not the alert state
 let prevMotion = null, hotCount = null, warmSamples = 0, warmFrames = [];
 let motionMask = null, maskBuf = null, prevMaskBuf = null;
 
@@ -691,6 +719,12 @@ function setRate(r) { rate = r; vid.playbackRate = r; $("rateVal").textContent =
 function updateStart() {
   $("start").disabled = !(cal && source);
   $("capFull").disabled = $("capBare").disabled = source !== "cam";
+  /* The label follows the SHIFT, not the run. Losing the camera or reaching the
+     end of a clip stops the run without ending anything, and if the button went
+     back to "Start" there would be no way left to close the shift -- pressing
+     it would open a second run inside the one already open. */
+  $("start").textContent = log ? "End" : "Start";
+  $("start").className = log ? "stop" : "go";
   checkAspect();
 }
 
@@ -769,13 +803,19 @@ function measureDetail(img) {
 }
 
 /* ---- the run ----------------------------------------------------------- */
-$("start").onclick = () => running ? stopRun() : startRun();
+$("start").onclick = () => running ? endShift() : startRun();
 /* Reset is the bobbin-swap button: same session, same camera, next bobbin. So
    it re-derives the baseline exactly as Start does. Hooking the reseed to
    Start alone left the one path whose entire purpose is "new bobbin" as the
    one that kept the old bobbin's threshold -- and the only way to get a fresh
    one was Stop then Start, which is the workflow Reset exists to avoid. */
 $("reset").onclick = () => {
+  // Reset is the operator saying a new scrap bobbin is on. It closes the run
+  // whatever ended the last one -- depleted, abandoned, a fault that would not
+  // clear -- and carries the exposure the old bobbin reached, which is what
+  // tells a missed alert apart from a bobbin pulled off early.
+  log?.add(Shift.EV.RUN_RESET, { peakPct: +clamped.toFixed(1) });
+  machineMoving = false;
   resetRun();
   $("runNote").className = "note";
   $("runNote").textContent = "reset";
@@ -870,9 +910,24 @@ async function startRun() {
   try { wakeLock = await navigator.wakeLock?.request("screen"); } catch {}
   if (source === "file") { vid.playbackRate = rate; await vid.play(); }
   running = true;
+  /* Start opens the shift; End closes it. Switching source or releasing the
+     camera also stops the run, but neither of those is the operator saying the
+     shift is over, so only the button ends it. Nothing is persisted mid-shift;
+     see §10 of docs/shift-tracking.md for why that is deliberate for now. */
+  if (!log) {
+    shiftNo += 1; store.set("shiftNo", shiftNo);
+    log = Shift.createLog(shiftNo);
+    log.add(Shift.EV.SHIFT_STARTED, { shiftNo, name: $("tShift").value.trim() || "Arvo" });
+    machineMoving = false;
+    if (cal) log.add(Shift.EV.CALIBRATION_APPLIED,
+      { baseline: cal.baselinePct ?? null, ceiling: cal.ceilingPct ?? null,
+        creamWarm: cal.creamWarm ?? null });
+  }
+  log.add(Shift.EV.RUN_STARTED);
+  $("bobbinDone").disabled = false;
+  paintTally();
   runStartedAt = performance.now() / 1000;
   updateStart();
-  $("start").textContent = "Stop"; $("start").className = "stop";
   $("dot").className = "dot live"; $("mState").textContent = "monitoring";
   $("runNote").className = "note"; $("runNote").textContent = "";
   loop();
@@ -885,7 +940,6 @@ function stopRun() {
   updateStart();
   wakeLock?.release?.().catch(() => {}); wakeLock = null;
   if (source === "file") vid.pause();
-  $("start").textContent = "Start"; $("start").className = "go";
   $("dot").className = "dot"; $("mState").textContent = "idle";
 }
 
@@ -938,7 +992,11 @@ function loop() {
   $("fill").className = clamped >= thr ? "hot" : "";
 
   consecutive = clamped >= thr ? consecutive + 1 : 0;
-  if (!fired && consecutive >= CONFIRM) { fired = true; fire(clamped); }
+  if (!fired && consecutive >= CONFIRM) {
+    fired = true;
+    log?.add(Shift.EV.DEPLETION_ALERTED, { pct: +clamped.toFixed(1) });
+    fire(clamped);
+  }
 }
 
 /* ---- has the unwind bobbin stopped turning? ----------------------------
@@ -1092,6 +1150,25 @@ function checkStopped(img, grid) {
 
   quietFor = m < stopAt ? quietFor + SAMPLE_S : 0;
   movingFor = m >= stopAt ? movingFor + SAMPLE_S : 0;
+
+  /* Record the machine's state before any of the suppressions below. The stop
+     that ends a bobbin is the one that makes warning time measurable, and it
+     happens precisely when the depletion alert has already fired -- the case
+     the alerting path deliberately stays quiet about. Detecting and notifying
+     are different jobs; this is the detecting one.
+
+     A stop is recorded on the first quiet sample, the same instant the alert
+     would fire. A restart needs RESUME_HOLD of sustained motion so a single
+     noisy frame cannot fake one, and is backdated by that hold so the recorded
+     time is when the machine actually moved, not when we were convinced. */
+  if (machineMoving && quietFor > 0) {
+    machineMoving = false;
+    log?.add(Shift.EV.MOTION_STOPPED);
+  } else if (!machineMoving && movingFor >= RESUME_HOLD) {
+    machineMoving = true;
+    log?.add(Shift.EV.MOTION_STARTED, { level: +m.toFixed(1) },
+             Date.now() - RESUME_HOLD * 1000);
+  }
   $("mMotion").textContent = `motion ${m.toFixed(1)}%/${stopAt.toFixed(1)}%` +
     (quietFor >= SAMPLE_S ? ` · still ${quietFor.toFixed(0)}s` : "");
   $("mMotion").style.color = quietFor >= SAMPLE_S ? "var(--amber)" : "";
@@ -1109,7 +1186,9 @@ function checkStopped(img, grid) {
      It does not vanish without trace: a stop that happened is worth knowing
      about afterwards, so the note records it and how long it lasted. */
   if (faultFired && movingFor >= RESUME_HOLD) {
-    const was = stoppedSince ? elapsed(Math.round((Date.now() - stoppedSince) / 1000)) : "a moment";
+    const heldFor = stoppedSince ? Math.round((Date.now() - stoppedSince) / 1000) : null;
+    log?.add(Shift.EV.STOP_CLEARED, { heldFor });
+    const was = stoppedSince ? elapsed(heldFor) : "a moment";
     clearFault(); clearAlarm();
     if (alertKind === "stopped") hideAlertScreen();
     faultFired = false; quietFor = 0; stoppedSince = null;
@@ -1145,6 +1224,7 @@ function clearFault() {
 }
 
 function fireFault() {
+  log?.add(Shift.EV.STOP_ALERTED);
   $("mState").textContent = "STOPPED";
   $("dot").className = "dot warn";
   $("faultNote").className = "note warn";
@@ -1413,6 +1493,7 @@ function clearAlarm() {
 $("alertAck").onclick = () => {
   clearAlarm();
   const wasStop = alertKind === "stopped";
+  if (!wasStop) log?.add(Shift.EV.DEPLETION_ACKNOWLEDGED);
   if (wasStop) {
     clearFault();
     $("faultNote").className = "note";
@@ -1433,6 +1514,100 @@ document.addEventListener("visibilitychange", () => {
   if (running && document.visibilityState === "visible")
     navigator.wakeLock?.request("screen").then(w => wakeLock = w).catch(() => {});
 });
+
+/* ---- shift counters, completion and export ------------------------------ */
+const mmss = sec => `${Math.floor(sec / 60)}:${String(Math.round(sec % 60)).padStart(2, "0")}`;
+const SHIFT_KEEP = 4;                   // completed shifts held on the tablet
+
+$("tShift").value = store.get("shiftName", "Arvo");
+$("tShift").oninput = () => store.set("shiftName", $("tShift").value.trim() || "Arvo");
+
+function paintTally() {
+  if (!log) {
+    $("tScrap").textContent = "0"; $("tDone").textContent = "0";
+    $("tIdle").textContent = "0:00";
+    $("tShift").disabled = false;
+    return;
+  }
+  const { shift } = log.derive({ now: Date.now() });
+  $("tScrap").textContent = shift.scrapBobbins;
+  $("tDone").textContent = shift.bobbinsCompleted;
+  $("tIdle").textContent = mmss(shift.totalIdleSeconds);
+  $("tShift").disabled = true;          // named at the start, fixed for the shift
+}
+setInterval(() => { if (log) paintTally(); }, 2000);
+
+function savedShifts() {
+  const v = store.get("shifts", []);
+  return Array.isArray(v) ? v : [];
+}
+
+/* A finished bobbin is counted where it happens and changes nothing else. The
+   rewinder reaching weight has no bearing on the scrap bobbin feeding it, which
+   usually still has tow on it and carries straight on. */
+$("bobbinDone").onclick = () => {
+  if (!log) return;
+  log.add(Shift.EV.BOBBIN_COMPLETED);
+  const { shift } = log.derive({ now: Date.now() });
+  paintTally();
+  $("sessionNote").className = "note ok";
+  $("sessionNote").textContent =
+    `Bobbin ${shift.bobbinsCompleted} completed this shift, from ${shift.scrapBobbins + 1} scrap bobbins so far.`;
+};
+
+/* End closes the shift and files it. Only this button does -- switching source
+   or losing the camera stops the run without ending anything. */
+function endShift() {
+  if (log) {
+    log.add(Shift.EV.SHIFT_ENDED, { peakPct: +clamped.toFixed(1) });
+    const { shift } = log.derive({ now: Date.now() });
+    /* Keep the events, not just the summary. The rules that turn one into the
+       other are new and will be revised; a summary cannot be recomputed. */
+    const kept = [...savedShifts(), { events: log.events, summary: shift }].slice(-SHIFT_KEEP);
+    store.set("shifts", kept);
+    log = null; machineMoving = false;
+    $("bobbinDone").disabled = true;
+    $("sessionNote").className = "note ok";
+    $("sessionNote").textContent =
+      `Shift "${shift.name}" ended — ${shift.bobbinsCompleted} bobbin${shift.bobbinsCompleted === 1 ? "" : "s"} ` +
+      `completed, ${shift.scrapBobbins} scrap bobbins used, ${mmss(shift.totalRunSeconds)} running, ` +
+      `${mmss(shift.totalIdleSeconds)} idle.`;
+  }
+  stopRun();
+  updateStart();
+  paintTally();
+}
+
+$("exportBtn").onclick = () => {
+  const all = savedShifts();
+  const live = log ? [{ events: log.events, summary: log.derive({ now: Date.now() }).shift }] : [];
+  const bundle = [...all, ...live];
+  if (!bundle.length) {
+    $("sessionNote").className = "note warn";
+    $("sessionNote").textContent = "Nothing recorded yet.";
+    return;
+  }
+  const rows = bundle.flatMap(b => {
+    const d = Shift.derive(b.events, { now: Date.now() });
+    return Shift.toCSV(d.runs, d.shift).split("\n").slice(1);
+  });
+  const header = Shift.toCSV([], null).split("\n")[0];
+  const stamp = new Date().toISOString().slice(0, 16).replace(/[:T]/g, "-");
+  download(`tow-shifts-${stamp}.csv`, [header, ...rows].join("\n"), "text/csv");
+  download(`tow-shifts-${stamp}.json`, JSON.stringify(bundle, null, 1), "application/json");
+  $("sessionNote").className = "note ok";
+  $("sessionNote").textContent = `Exported ${bundle.length} shift${bundle.length > 1 ? "s" : ""}.`;
+};
+
+function download(name, text, type) {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([text], { type }));
+  a.download = name;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+}
+
+paintTally();
 
 $("verChip").textContent = `v${VERSION}` + (BUILD === "dev" ? " dev" : ` · ${BUILD}`);
 
