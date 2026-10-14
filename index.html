@@ -231,6 +231,9 @@
                autocorrect="off" spellcheck="false" inputmode="latin">
       </div>
       <div class="row">
+        <button id="pushBtn">Push to phone</button>
+      </div>
+      <div class="row">
         <button id="testNtfy">Send test</button>
       </div>
       <div class="row">
@@ -303,7 +306,7 @@ const gctx = grab.getContext("2d", { willReadFrequently: true });
    reload can show the old shell while the new one installs behind it. A build
    string settles that in a glance instead of by hunting for a changed word. */
 const VERSION = "1.0.0";
-const BUILD = "7820683";        // rewritten on publish; "dev" means a local checkout
+const BUILD = "e79d398";        // rewritten on publish; "dev" means a local checkout
 
 const SAMPLE_S = 0.5;        // seconds between samples, in SOURCE time
 const MEDIAN_WINDOW = 5;     // smooth before the clamp, so one spike cannot ratchet
@@ -457,6 +460,11 @@ let stopAt;                         // undefined = not decided yet, null = not a
 const clampNum = (v, r) => Math.max(r.min, Math.min(r.max, v || r.def));
 let depEvery = clampNum(+store.get("depEvery", DEP_EVERY.def), DEP_EVERY);
 let stopEvery = clampNum(+store.get("stopEvery", STOP_EVERY.def), STOP_EVERY);
+/* Off unless asked for. The screen, the beeps and the spoken announcement all
+   still fire -- this governs only the POST that leaves the building. Default on
+   would mean a phone buzzing through every test and recalibration, and an alert
+   people learn to ignore is worse than one they never had. */
+let pushOn = store.get("pushOn", false);
 let faultOn = store.get("faultOn", true);
 let sayOn = store.get("sayOn", true);
 let sayEvery = { low: clampNum(+store.get("sayLow", SAY_EVERY.low.def), SAY_EVERY.low),
@@ -1253,6 +1261,12 @@ function fireFault() {
   startAlarm();
   clearFault();
   faultSends = faultOk = faultFail = 0;
+  if (!pushOn) {
+    $("alertSends").textContent = "Alerting on this tablet only — push is off";
+    $("faultNote").className = "note warn";
+    $("faultNote").textContent = "Machine appears to have stopped. Push to phone is off.";
+    return;
+  }
   const since = Date.now();
   const maxSends = Math.floor(STOP_FOR_S / stopEvery) + 1;
   const send = async () => {
@@ -1295,6 +1309,16 @@ function fire(pct) {
   startAlarm();
   clearRepeats();
   sendsOk = sendsFail = 0;
+  /* With push off there is nothing to schedule. Letting the ticker run would
+     fail on every tick and paint "could NOT notify" over an alert that is
+     working perfectly -- the screen is lit, the alarm is sounding and the
+     speaker is talking. A deliberate setting must not look like a fault. */
+  if (!pushOn) {
+    $("alertSends").textContent = "Alerting on this tablet only — push is off";
+    $("runNote").className = "note";
+    $("runNote").textContent = "Bobbin low. Push to phone is off.";
+    return;
+  }
   const schedule = depletionSchedule();
   schedule.forEach((at, i) =>
     repeatTimers.push(setTimeout(() => sendAlert(n => n, i + 1, schedule.length, at), at * 1000)));
@@ -1377,6 +1401,21 @@ function paintIntervals() {
 }
 paintIntervals();
 
+function paintPush() {
+  $("pushBtn").textContent = pushOn ? "Push to phone: ON" : "Push to phone: OFF";
+  $("pushBtn").classList.toggle("seg", true);
+  $("pushBtn").classList.toggle("on", pushOn);
+  $("netChip").style.opacity = pushOn ? "" : ".45";
+}
+paintPush();
+$("pushBtn").onclick = () => {
+  pushOn = !pushOn; store.set("pushOn", pushOn); paintPush();
+  $("ntfyNote").className = "note" + (pushOn ? "" : " warn");
+  $("ntfyNote").textContent = pushOn
+    ? "Alerts will be pushed to the phone."
+    : "Alerts stay on this tablet — screen, beeps and speaker only.";
+};
+
 $("faultBtn").onclick = () => {
   faultOn = !faultOn;
   store.set("faultOn", faultOn);
@@ -1399,6 +1438,7 @@ paintFault();
    turns this into a CORS preflight for no benefit; a JSON body is a simple
    request and goes straight through. */
 async function notify(message, title = "Bobbin low") {
+  if (!pushOn) return "push off";
   const topic = $("topic").value.trim();
   if (!topic) return "no topic set";
   try {
@@ -1423,7 +1463,9 @@ $("testNtfy").onclick = async () => {
   n.className = "note " + (r === true ? "ok" : "bad");
   n.textContent = r === true
     ? "Sent. It should appear on your phone within a second or two."
-    : "Failed: " + r + ". Check the hotspot is on and this tablet has joined it.";
+    : r === "push off"
+    ? "Push is off — turn it on above to send to the phone."
+    : "Failed: " + r + ". Check this tablet has internet, and the topic is right.";
 };
 
 /* ---- alarm ------------------------------------------------------------- */
