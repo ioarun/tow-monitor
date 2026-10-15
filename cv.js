@@ -570,6 +570,57 @@ function cfStopThresholdFrom(runningLevel) {
   return Math.max(CF_STOP_FLOOR, runningLevel * CF_STOP_FRACTION);
 }
 
+/* --- the machine, or a person? --------------------------------------------
+ * A hand on the bobbin changes pixels inside the mask just as a turning bobbin
+ * does, so the mask alone cannot tell a restart from an operator at work. WHERE
+ * the change is can. The machine's motion is confined to the mask -- that is
+ * how the mask was chosen -- while a hand arrives on an arm, and an arm, a body
+ * or a swinging door changes the frame around it as well.
+ *
+ * So a restart is believed only while the change is concentrated in the mask:
+ * the share of mask points changing must be RESTART_RATIO times the share
+ * changing everywhere else. A ratio rather than a fixed "outside is busy" line,
+ * because the rest of the frame is not still while the machine runs -- it
+ * reached 8% on stop_video, and an arm worked over the bobbin sat at 7-12%. Any
+ * line low enough to see the arm also sees the machine.
+ *
+ * Measured on stop_video (848x478), with an arm painted into a 30 s stop:
+ *   running machine                 4.4 at its lowest, median 27
+ *   a hand working over the bobbin  1.3 median, 3.1 at most
+ *   the real disturbance at 75.5 s  0.4 - 0.8
+ * At 4 the hand faked no restart (7 without the check), and every genuine
+ * restart was still accepted on its first sample. The arm was synthetic; real
+ * footage of a hand at the machine is the test this still needs.
+ *
+ * Points within OUTSIDE_MARGIN grid cells of the mask count as neither inside
+ * nor outside. The mask is a sampled set, and its fringe moves with the machine. */
+const RESTART_RATIO = 4;
+const OUTSIDE_MARGIN = 2;
+
+/* Columns and rows of the grid sampleGray(img, step) returns. */
+function gridSize(width, height, step) {
+  return [Math.ceil(width / step), Math.ceil(height / step)];
+}
+
+function outsideIndices(mask, cols, rows, margin = OUTSIDE_MARGIN) {
+  const near = new Uint8Array(cols * rows);
+  for (const k of mask) {
+    const x = k % cols, y = (k / cols) | 0;
+    for (let yy = Math.max(0, y - margin); yy <= Math.min(rows - 1, y + margin); yy++)
+      for (let xx = Math.max(0, x - margin); xx <= Math.min(cols - 1, x + margin); xx++)
+        near[yy * cols + xx] = 1;
+  }
+  const out = [];
+  for (let k = 0; k < near.length; k++) if (!near[k]) out.push(k);
+  return Int32Array.from(out);
+}
+
+/* Multiplied out rather than divided, so a perfectly still surround (0%) is
+   simply concentrated instead of a division by zero. */
+function concentrated(inside, outside) {
+  return outside === null || inside >= RESTART_RATIO * outside;
+}
+
 /* Grey samples inside the ROI's bounding box, subsampled by 2. Not masked to
  * the rotated rectangle: the bounding box is cheaper, and for a difference
  * the few corner pixels of background are common-mode anyway. */
@@ -685,6 +736,7 @@ const CV = { GAIN_MIN, CREAM_WARM, BAND_FRACTION, BASELINE_MAX, CEILING_MIN,
              ASPECT_TOLERANCE, ANALYSIS_MAX,
              sampleGray, noiseFloorFor, changedFraction, cfStopThresholdFrom,
              NOISE_PCTL, CF_STOP_FRACTION, CF_STOP_FLOOR, CF_RUNNING_MIN,
+             RESTART_RATIO, OUTSIDE_MARGIN, gridSize, outsideIndices, concentrated,
              GAIN_RANGE, CREAM_RANGE,
              warmth, openBinary, largestComponent, principalAxis, percentile, otsu,
              roiWarmthValues, regionFrom, madSigma, creamThresholdFor,

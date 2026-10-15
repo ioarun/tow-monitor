@@ -23,7 +23,7 @@
     font-size:14px; padding:var(--top) var(--right) var(--bot) var(--left);
     display:flex; flex-direction:column;
   }
-  header { display:flex; align-items:center; gap:10px; padding:8px 14px;
+  header { display:flex; align-items:center; gap:6px 10px; padding:8px 14px; flex-wrap:wrap;
            border-bottom:1px solid var(--rule); flex:none; }
   h1 { font-size:14px; font-weight:600; margin:0; }
   .dot { width:8px; height:8px; border-radius:50%; background:var(--soft); flex:none; }
@@ -53,17 +53,45 @@
   @media (orientation:portrait) { aside { width:auto; border-left:none;
           border-top:1px solid var(--rule); max-height:46vh; } }
 
-  /* The one number read from a distance, so it gets the space. Clamped rather
-     than fixed: the panel is 320px in landscape but full width in portrait,
-     and tabular figures mean "100.0%" occupies the same box as "0.0%". */
-  .pct { font-size:clamp(52px,7.5vw,78px); font-weight:650; font-variant-numeric:tabular-nums;
-         letter-spacing:-.035em; line-height:1; }
   .lbl { font-size:11px; text-transform:uppercase; letter-spacing:.11em; color:var(--soft); }
-  .bar { height:9px; border-radius:5px; background:#223036; overflow:hidden; margin:10px 0 4px; }
+
+  /* The readout sits on the picture, along its bottom edge. It is read from
+     across the room, and in the side panel it had to share 320px with every
+     setting -- so the numbers were small exactly where they mattered most. The
+     bobbin is at the top of the frame, so the bottom is the part of the picture
+     nobody needs to see. placeHud() pins it to the video's own bottom edge,
+     and lifts it clear of the playback controls when a file is playing.
+     Sized in vmin so the same layout holds on a phone and a 13" tablet. */
+  .hud { position:absolute; left:0; right:0; bottom:0; z-index:2; pointer-events:none;
+         padding:clamp(10px,2.4vmin,22px) clamp(12px,2.8vmin,26px) clamp(8px,1.8vmin,16px);
+         background:linear-gradient(to top, rgba(6,10,12,.88), rgba(6,10,12,.74) 72%, rgba(6,10,12,0));
+         text-shadow:0 1px 3px rgba(0,0,0,.55); }
+  .hud input { pointer-events:auto; text-shadow:inherit; }
+  .hudMain { display:flex; align-items:flex-end; gap:clamp(14px,3vmin,30px); }
+  .hudSide { flex:1; min-width:0; padding-bottom:.4em; }
+  .hud .lbl { font-size:clamp(12px,1.9vmin,16px); }
+  /* The one number read from a distance, so it gets the space. Tabular figures
+     mean "100.0%" occupies the same box as "0.0%", so nothing beside it moves. */
+  .pct { font-size:clamp(56px,12vmin,128px); font-weight:650; font-variant-numeric:tabular-nums;
+         letter-spacing:-.035em; line-height:1; }
+  .bar { height:clamp(10px,1.8vmin,16px); border-radius:8px; background:rgba(34,48,54,.9);
+         overflow:hidden; margin:0 0 clamp(8px,1.6vmin,14px); }
   .bar > i { display:block; height:100%; width:0; background:var(--cyan); transition:width .25s; }
   .bar > i.hot { background:var(--red); }
-  .meta { font-size:11px; color:var(--soft); display:flex; gap:12px; flex-wrap:wrap;
-          font-variant-numeric:tabular-nums; }
+  .meta { font-size:clamp(14px,2.3vmin,20px); color:var(--soft); display:flex;
+          gap:.3em 1.1em; flex-wrap:wrap; font-variant-numeric:tabular-nums; margin-top:.35em; }
+  /* While someone is at the machine the camera is not believed, and the
+     operator should be able to see that from where they are standing. */
+  .attend { display:inline-block; margin-bottom:clamp(8px,1.6vmin,14px);
+            padding:.3em .7em; border-radius:8px; background:var(--amber); color:#2a1a05;
+            font-size:clamp(15px,2.6vmin,24px); font-weight:650; text-shadow:none; }
+  .attend b { font-variant-numeric:tabular-nums; }
+  button.attendBtn { font-size:15px; padding:14px 12px; white-space:normal; }
+  button.attendBtn.on { background:var(--amber); color:#2a1a05; border-color:var(--amber); }
+  /* Away is not an alert state: nothing is wrong, nothing is being watched.
+     Slate rather than amber, so it cannot be mistaken for one. */
+  .attend.away { background:#54646d; color:#f2f7f9; }
+  button.awayOn { background:#54646d; color:#f2f7f9; border-color:#54646d; }
 
   section { margin-top:16px; padding-top:14px; border-top:1px solid var(--rule); }
   section > .lbl { display:block; margin-bottom:8px; }
@@ -92,26 +120,30 @@
   .thumb { flex:1; min-width:0; width:50%; aspect-ratio:16/9; border-radius:6px;
            border:1px dashed var(--rule); background:#0b1115; }
   .thumb.has { border-style:solid; border-color:var(--cyan); }
-  /* The operator's three numbers, in the zone they already watch. Small,
-     because they are context for the big reading above, not competition. */
-  .tally { display:flex; gap:18px; margin:2px 0 8px; flex-wrap:wrap; }
-  .tally span { font-size:11px; color:var(--dim); letter-spacing:.04em;
-                text-transform:uppercase; display:flex; align-items:baseline; gap:5px; }
-  .tally b { font-size:15px; color:var(--ink); letter-spacing:-.01em; }
+  /* The operator's numbers, beside the reading they already watch. Smaller than
+     the reading, because they are context for it, not competition -- but big
+     enough to read from the machine. */
+  .tally { display:flex; gap:.4em 1.6em; flex-wrap:wrap; align-items:flex-end; }
+  /* Label above figure, read as a row of gauges. column-reverse because the
+     input comes first in the markup and the label is the text after it. */
+  .tally span { font-size:clamp(12px,1.9vmin,16px); color:var(--soft); letter-spacing:.04em;
+                text-transform:uppercase; display:flex; flex-direction:column-reverse;
+                align-items:flex-start; gap:.15em; }
+  .tally b { font-size:clamp(20px,3.6vmin,32px); color:var(--ink); letter-spacing:-.01em; }
   /* The shift is a name the operator types, not a number we allocate -- the
      words that mean something here are theirs ("Arvo", "Night"), and an index
      would make them translate every time they looked at it. */
-  .shiftName { font-size:15px; color:var(--ink); background:transparent;
+  .shiftName { font-size:clamp(20px,3.6vmin,32px); color:var(--ink); background:transparent;
                border:0; border-bottom:1px dashed var(--rule); padding:0 2px 1px;
-               width:5.2em; font-family:inherit; letter-spacing:-.01em; }
+               width:4.4em; font-family:inherit; letter-spacing:-.01em; }
   .shiftName:focus { outline:none; border-bottom-color:var(--accent); }
   /* Editable, because a shift often picks up a part-made bobbin and the
      counters have to start where the machine actually is. Typing a figure sets
      what was carried in; the app counts up from there. */
-  .tally .num { font-size:15px; color:var(--ink); background:transparent; border:0;
-                border-bottom:1px dashed var(--rule); padding:0 2px 1px; width:2.4em;
-                font-family:inherit; letter-spacing:-.01em; text-align:right; }
-  .tally .num.wide { width:3.6em; }
+  .tally .num { font-size:clamp(20px,3.6vmin,32px); color:var(--ink); background:transparent; border:0;
+                border-bottom:1px dashed var(--rule); padding:0 2px 1px; width:2.6em;
+                font-family:inherit; letter-spacing:-.01em; text-align:left; }
+  .tally .num.wide { width:3.4em; }
   .tally .num:focus { outline:none; border-bottom-color:var(--accent); }
   .hidden { display:none !important; }
 
@@ -130,6 +162,9 @@
   #alert p { margin:0; font-size:16px; max-width:34ch; line-height:1.5; }
   #alert button { flex:none; background:#fff; color:#7d1a14; border-color:#fff;
                   font-size:17px; font-weight:600; padding:16px 28px; }
+  /* Here as well as in the panel, because the alert covers the panel and this
+     is the moment the operator arrives and opens the door. */
+  #alert #alertAttend { background:transparent; color:#fff; white-space:normal; max-width:100%; }
 </style>
 </head>
 <body>
@@ -152,28 +187,40 @@
     <div class="empty" id="empty">
       Calibrate from a recorded depletion, then choose a source.
     </div>
+    <div class="hud" id="hud">
+      <div class="attend hidden" id="attendBanner">Operator at machine · camera ignored ·
+        <b id="attendLeft">5:00</b></div>
+      <div class="attend away hidden" id="awayBanner">Operator away · not monitoring,
+        nothing being recorded</div>
+      <div class="hudMain">
+        <div>
+          <div class="lbl">core exposed</div>
+          <div class="pct" id="pct">—</div>
+        </div>
+        <div class="hudSide">
+          <div class="bar"><i id="fill"></i></div>
+          <div class="tally" id="tally">
+            <span><input id="tShift" class="shiftName" spellcheck="false"
+                         autocomplete="off" maxlength="12">shift</span>
+            <span><input id="tScrap" class="num" inputmode="numeric">scrap bobbins used</span>
+            <span><input id="tDone" class="num" inputmode="numeric">completed</span>
+            <span><input id="tIdle" class="num wide" inputmode="numeric">idle</span>
+            <span><b id="tTotalIdle">0:00</b>total idle</span>
+          </div>
+        </div>
+      </div>
+      <div class="meta">
+        <span id="mState">idle</span>
+        <span id="mThr">—</span>
+        <span id="mWarm"></span>
+        <span id="mMotion"></span>
+        <span id="mDrift"></span>
+      </div>
+    </div>
   </div>
 
   <aside>
-    <div class="lbl">core exposed</div>
-    <div class="pct" id="pct">—</div>
-    <div class="bar"><i id="fill"></i></div>
-    <div class="tally" id="tally">
-      <span><input id="tShift" class="shiftName" spellcheck="false"
-                   autocomplete="off" maxlength="12">shift</span>
-      <span><input id="tScrap" class="num" inputmode="numeric">scrap bobbins used</span>
-      <span><input id="tDone" class="num" inputmode="numeric">completed</span>
-      <span><input id="tIdle" class="num wide" inputmode="numeric">idle</span>
-    </div>
-    <div class="meta">
-      <span id="mState">idle</span>
-      <span id="mThr">—</span>
-      <span id="mWarm"></span>
-      <span id="mMotion"></span>
-      <span id="mDrift"></span>
-    </div>
-
-    <section>
+    <section style="margin-top:0;padding-top:0;border-top:0">
       <span class="lbl">1 · Source</span>
       <div class="row">
         <button class="seg" id="srcCam">Live camera</button>
@@ -213,6 +260,16 @@
         <button id="reset">Reset</button>
       </div>
       <p class="note" id="runNote"></p>
+      <div class="row">
+        <button id="attendBtn" class="attendBtn" disabled>Operator intervention</button>
+      </div>
+      <p class="note" id="attendNote">Press when the machine door opens — a fault, a swap,
+        anything. The camera is ignored until you press again, press Reset, or 5 minutes pass.</p>
+      <div class="row">
+        <button id="awayBtn" class="attendBtn" disabled>Operator away</button>
+      </div>
+      <p class="note" id="awayNote">Press when you leave. Monitoring and the clock both stop,
+        and stay stopped until you press it again — no time limit.</p>
       <div class="row">
         <button id="faultBtn">Stop detection</button>
       </div>
@@ -286,6 +343,7 @@
   <p id="alertMsg">Core exposed — get ready to stop the machine.</p>
   <p id="alertSends" style="font-size:13px;opacity:.85"></p>
   <button id="alertAck">Acknowledge</button>
+  <button id="alertAttend">Acknowledge + operator intervention</button>
 </div>
 
 <script src="cv.js"></script>
@@ -306,7 +364,7 @@ const gctx = grab.getContext("2d", { willReadFrequently: true });
    reload can show the old shell while the new one installs behind it. A build
    string settles that in a glance instead of by hunting for a changed word. */
 const VERSION = "1.0.0";
-const BUILD = "552f0c5";        // rewritten on publish; "dev" means a local checkout
+const BUILD = "1abfc08";        // rewritten on publish; "dev" means a local checkout
 
 const SAMPLE_S = 0.5;        // seconds between samples, in SOURCE time
 const MEDIAN_WINDOW = 5;     // smooth before the clamp, so one spike cannot ratchet
@@ -425,6 +483,24 @@ const MOTION_STEP = 4;      // whole-frame subsample the mask is selected from
 const HOT_FRAC = 0.25;      // beat the floor this often in warm-up to join the mask
 const MIN_MASK = 50;        // fewer sampled pixels than this and the count is noise
 
+/* Operator intervention: pressed when the machine door opens, for a fault, a
+ * swap, or anything else. The machine is interlocked and cannot run with the
+ * door open, so while this is on, whatever moves in front of the camera is a
+ * person, and nothing it sees is believed: no restart, no stop alert, no
+ * depletion reading (skin reads warm, and the reading only ever goes up).
+ *
+ * It ends when pressed again, on Reset, at End, or after INTERVENTION_MAX_S --
+ * a button left on would blind the camera for the rest of the shift, so it
+ * cannot be left on. Ending on the timeout is said aloud, because the operator
+ * may still be inside the machine and should know the camera is back.
+ *
+ * Once it ends, a stopped machine gets AFTER_INTERVENTION_S before it raises
+ * the stop alert. Without that, closing the door and pressing the button would
+ * set off "machine stopped" in the operator's face, every time, before they had
+ * reached the start button. */
+const INTERVENTION_MAX_S = 300;
+const AFTER_INTERVENTION_S = 60;
+
 
 const store = {
   get(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : JSON.parse(v); }
@@ -475,6 +551,9 @@ let log = null, shiftNo = +(store.get("shiftNo", 0)) || 0;
 let machineMoving = false;        // the recorded state, not the alert state
 let prevMotion = null, hotCount = null, warmSamples = 0, warmFrames = [];
 let motionMask = null, maskBuf = null, prevMaskBuf = null;
+let motionOutside = null, outBuf = null, prevOutBuf = null;   // the frame around the mask
+let attendedSince = null, attendTimer = null, attendTicker = null, alertHoldUntil = 0;
+let awaySince = null;
 
 /* ---- setup restore ---------------------------------------------------- */
 $("topic").value = store.get("topic", null) ?? DEFAULT_TOPIC;
@@ -582,11 +661,15 @@ $("calFile").onchange = async e => {
   } finally {
     URL.revokeObjectURL(url);
     e.target.value = "";
+    resumeShift();
   }
 };
 
 /* ---- sources ---------------------------------------------------------- */
-function showStage(on) { $("empty").classList.toggle("hidden", on); $("wrap").style.display = on ? "" : "none"; }
+function showStage(on) {
+  $("empty").classList.toggle("hidden", on); $("wrap").style.display = on ? "" : "none";
+  placeHud();
+}
 showStage(false);
 
 $("srcCam").onclick = async () => {
@@ -617,6 +700,7 @@ $("srcCam").onclick = async () => {
   $("calHint").textContent = `Camera at ${vid.videoWidth}×${vid.videoHeight}. Two stills, ` +
     `nothing in between: a full bobbin, then the bare tube in the same place. ` +
     `Lock exposure and white balance first if the camera app allows it.`;
+  resumeShift();
 };
 
 $("srcFile").onclick = () => $("playFile").click();
@@ -633,6 +717,7 @@ $("playFile").onchange = async e => {
   source = "file"; segment("srcFile"); $("rateRow").classList.remove("hidden");
   showStage(true); sizeOverlay(); updateStart();
   e.target.value = "";
+  resumeShift();
 };
 
 function segment(onId) {
@@ -735,12 +820,16 @@ function setRate(r) { rate = r; vid.playbackRate = r; $("rateVal").textContent =
 function updateStart() {
   $("start").disabled = !(cal && source);
   $("capFull").disabled = $("capBare").disabled = source !== "cam";
-  /* The label follows the SHIFT, not the run. Losing the camera or reaching the
-     end of a clip stops the run without ending anything, and if the button went
-     back to "Start" there would be no way left to close the shift -- pressing
-     it would open a second run inside the one already open. */
+  /* The button follows the SHIFT, not the run. Changing source stops the run
+     without ending anything, and if the button went back to "Start" there would
+     be no way left to close the shift. It once kept the "End" label while still
+     acting on the run, so pressing End on a stopped run started it again and
+     the shift never closed. Both now come from `log`, and resumeShift() is what
+     restarts a stopped run. */
   $("start").textContent = log ? "End" : "Start";
   $("start").className = log ? "stop" : "go";
+  paintIntervention();
+  paintAway();
   checkAspect();
 }
 
@@ -760,10 +849,24 @@ vid.addEventListener("loadedmetadata", checkAspect);
 
 /* ---- overlay ----------------------------------------------------------- */
 function sizeOverlay() {
+  placeHud();
   const r = vid.getBoundingClientRect();
   if (!r.width) return;
   ov.width = Math.round(r.width); ov.height = Math.round(r.height);
 }
+
+/* The video is letterboxed inside the stage, so "the bottom of the stage" can
+   be a black bar under the picture. Pin the readout to the picture's own
+   bottom edge instead -- and when a file is playing, above its controls, which
+   would otherwise sit underneath the readout where nobody can see them. */
+const CONTROLS_PX = 52;
+function placeHud() {
+  const hud = $("hud"), shown = $("wrap").style.display !== "none" && vid.videoWidth;
+  if (!shown) { hud.style.bottom = "0px"; return; }
+  const s = hud.parentElement.getBoundingClientRect(), v = vid.getBoundingClientRect();
+  hud.style.bottom = Math.max(0, Math.round(s.bottom - v.bottom) + (vid.controls ? CONTROLS_PX : 0)) + "px";
+}
+new ResizeObserver(placeHud).observe(document.querySelector(".stage"));
 new ResizeObserver(sizeOverlay).observe(vid);
 vid.addEventListener("loadedmetadata", sizeOverlay);
 
@@ -819,7 +922,14 @@ function measureDetail(img) {
 }
 
 /* ---- the run ----------------------------------------------------------- */
-$("start").onclick = () => running ? endShift() : startRun();
+$("start").onclick = () => log ? endShift() : startRun();
+
+/* A shift that is open should be watching the machine. Choosing a source or
+   recalibrating from a saved video stops the run to do it, and with the button
+   meaning End while a shift is open, nothing else would start it again. */
+function resumeShift() {
+  if (log && !running && cal && source && awaySince === null) startRun({ resume: true });
+}
 /* Reset is the bobbin-swap button: same session, same camera, next bobbin. So
    it re-derives the baseline exactly as Start does. Hooking the reseed to
    Start alone left the one path whose entire purpose is "new bobbin" as the
@@ -830,6 +940,9 @@ $("reset").onclick = () => {
   // whatever ended the last one -- depleted, abandoned, a fault that would not
   // clear -- and carries the exposure the old bobbin reached, which is what
   // tells a missed alert apart from a bobbin pulled off early.
+  // A swap is the commonest reason to be at the machine, and Reset is the last
+  // thing done before walking away, so it ends the intervention too.
+  endIntervention("reset");
   log?.add(Shift.EV.RUN_RESET, { peakPct: +clamped.toFixed(1) });
   machineMoving = false;
   resetRun();
@@ -853,6 +966,7 @@ function resetRun() {
   noiseFloor = null; noiseSamples = []; prevFull = null;
   prevMotion = null; hotCount = null; warmSamples = 0; warmFrames = [];
   motionMask = null; maskBuf = prevMaskBuf = null;
+  motionOutside = null; outBuf = prevOutBuf = null;
   if (alertKind === "stopped") hideAlertScreen();
   $("faultNote").textContent = ""; $("mMotion").textContent = "";
   window_ = []; clamped = 0; consecutive = 0; fired = false; lastSampleT = -Infinity;
@@ -907,11 +1021,23 @@ function reseedBaseline() {
          drifted ? "warn" : "ok");
 }
 
-async function startRun() {
+async function startRun({ resume = false } = {}) {
   if (!cal || !source) return;
   if (checkAspect()) return;          // the number would be meaningless; say so instead
+  /* The noise floor belongs to the SENSOR, not to the moment -- see the note
+     on it in cv.js. Re-measuring it on a resume means measuring it over
+     whatever the machine happened to be doing in those three seconds, and if
+     that is a fast stretch the percentile rises with the motion it is meant
+     to exclude: measured on stop_video, a floor of 7 at the start of a run
+     became 46 on a resume, which cut the mask from 633 points to 31 and
+     refused to arm. Carry it across instead; the camera has not changed. */
+  const keepFloor = resume ? noiseFloor : null;
   resetRun();
-  reseedBaseline();
+  noiseFloor = keepFloor;
+  /* Not on a resume. The bobbin on the machine is part used, and fitting the
+     threshold to a tube that is already showing would set it above the tan --
+     the run would then read zero to the end. See RESEED_MAX. */
+  if (!resume) reseedBaseline();
   // The first tap of the session is the only chance to unlock audio on iOS,
   // and it has to happen before anything needs to make a sound.
   audio = audio || new (window.AudioContext || window.webkitAudioContext)();
@@ -946,7 +1072,9 @@ async function startRun() {
   runStartedAt = performance.now() / 1000;
   updateStart();
   $("dot").className = "dot live"; $("mState").textContent = "monitoring";
-  $("runNote").className = "note"; $("runNote").textContent = "";
+  $("runNote").className = "note";
+  $("runNote").textContent = resume
+    ? `Monitoring resumed — stop detection re-arms in ${MOTION_WARMUP}s.` : "";
   loop();
 }
 
@@ -997,6 +1125,12 @@ function loop() {
   }
   if (faultOn) checkStopped(img, grid);
 
+  /* Frozen, not just quietened, while someone is at the machine. A hand in the
+     region reads as bare core -- skin is warm -- and the reading is clamped to
+     only ever rise, so one reach for the bobbin would hold a false high for
+     the rest of the run and could fire the depletion alert outright. */
+  if (attendedSince !== null) return;
+
   window_.push(detail.pct);
   if (window_.length > MEDIAN_WINDOW) window_.shift();
   const sorted = [...window_].sort((a, b) => a - b);
@@ -1030,8 +1164,8 @@ function loop() {
    because both this frame and the previous one are gathered every sample, and
    allocating a pair of typed arrays twice a second for the length of a run is
    garbage the tablet does not need to collect. */
-function gatherMask(src, buf) {
-  for (let i = 0; i < motionMask.length; i++) buf[i] = src[motionMask[i]];
+function gatherMask(src, buf, idx = motionMask) {
+  for (let i = 0; i < idx.length; i++) buf[i] = src[idx[i]];
   return buf;
 }
 
@@ -1097,6 +1231,11 @@ function checkStopped(img, grid) {
     if (motionMask) {
       maskBuf = new Float32Array(motionMask.length);
       prevMaskBuf = new Float32Array(motionMask.length);
+      // Everything else in the frame, less a fringe round the mask: what a
+      // restart is checked against. See RESTART_RATIO in cv.js.
+      motionOutside = CV.outsideIndices(motionMask, ...CV.gridSize(img.width, img.height, MOTION_STEP));
+      outBuf = new Float32Array(motionOutside.length);
+      prevOutBuf = new Float32Array(motionOutside.length);
       const levels = [];
       /* Two different buffers, or the second gather overwrites the first and
          every pair compares a frame with itself -- which reads as a dead
@@ -1151,6 +1290,10 @@ function checkStopped(img, grid) {
     ? CV.changedFraction(gatherMask(motion, maskBuf),
                          gatherMask(prevMotion, prevMaskBuf), noiseFloor)
     : null;
+  const o = m !== null && motionOutside
+    ? CV.changedFraction(gatherMask(motion, outBuf, motionOutside),
+                         gatherMask(prevMotion, prevOutBuf, motionOutside), noiseFloor)
+    : null;
   prevMotion = motion; prevFull = full; prevGrid = grid;
   if (m === null) {
     if (!motionMask) {
@@ -1165,8 +1308,17 @@ function checkStopped(img, grid) {
     return;
   }
 
+  /* Stopping and starting are not judged alike. A quiet mask is a stopped
+     machine whatever else is going on in the frame -- a person cannot make the
+     bobbin look still. Motion in the mask is a running machine only if it is
+     concentrated there (CV.concentrated): a hand on the bobbin moves the mask
+     too, but it arrives on an arm, and the arm moves everything around it.
+     And while someone is at the machine, nothing counts as a restart at all --
+     it cannot run with the door open. */
+  const attended = attendedSince !== null;
+  const machineLike = m >= stopAt && CV.concentrated(m, o);
   quietFor = m < stopAt ? quietFor + SAMPLE_S : 0;
-  movingFor = m >= stopAt ? movingFor + SAMPLE_S : 0;
+  movingFor = machineLike && !attended ? movingFor + SAMPLE_S : 0;
 
   /* Record the machine's state before any of the suppressions below. The stop
      that ends a bobbin is the one that makes warning time measurable, and it
@@ -1177,18 +1329,32 @@ function checkStopped(img, grid) {
      A stop is recorded on the first quiet sample, the same instant the alert
      would fire. A restart needs RESUME_HOLD of sustained motion so a single
      noisy frame cannot fake one, and is backdated by that hold so the recorded
-     time is when the machine actually moved, not when we were convinced. */
+     time is when the machine actually moved, not when we were convinced.
+
+     The depletion reading at a stop is kept with it: it is what tells a stop
+     at 40% in the rush apart from the real one at 99%. The surround is kept on
+     both, so a restart that should not have been believed can be found later. */
+  const around = o === null ? null : +o.toFixed(1);
   if (machineMoving && quietFor > 0) {
     machineMoving = false;
-    log?.add(Shift.EV.MOTION_STOPPED);
+    log?.add(Shift.EV.MOTION_STOPPED, { pct: +clamped.toFixed(1), outside: around });
   } else if (!machineMoving && movingFor >= RESUME_HOLD) {
     machineMoving = true;
-    log?.add(Shift.EV.MOTION_STARTED, { level: +m.toFixed(1) },
+    alertHoldUntil = 0;     // the hold covered the stop the operator dealt with, not the next
+    log?.add(Shift.EV.MOTION_STARTED, { level: +m.toFixed(1), outside: around },
              Date.now() - RESUME_HOLD * 1000);
   }
-  $("mMotion").textContent = `motion ${m.toFixed(1)}%/${stopAt.toFixed(1)}%` +
-    (quietFor >= SAMPLE_S ? ` · still ${quietFor.toFixed(0)}s` : "");
-  $("mMotion").style.color = quietFor >= SAMPLE_S ? "var(--amber)" : "";
+  /* "around" is the surround's figure. When the mask is moving but the
+     surround is moving too, say that it is being discounted -- otherwise a
+     detector refusing a hand looks exactly like one failing to see a restart. */
+  const discounted = !attended && m >= stopAt && !machineLike;
+  $("mMotion").textContent = attended
+    ? `motion ${m.toFixed(1)}% · ignored, operator at machine`
+    : `motion ${m.toFixed(1)}%/${stopAt.toFixed(1)}%` +
+      (around !== null ? ` · around ${around.toFixed(1)}%` : "") +
+      (discounted ? " · not the machine" : "") +
+      (quietFor >= SAMPLE_S ? ` · still ${quietFor.toFixed(0)}s` : "");
+  $("mMotion").style.color = quietFor >= SAMPLE_S || discounted ? "var(--amber)" : "";
 
   /* A stop alert answers itself once the machine runs again, however it came
      to be running. The usual path is the operator walking over, fixing it and
@@ -1222,6 +1388,9 @@ function checkStopped(img, grid) {
   // they were told to do. Reporting it as a fault would be the system
   // alarming at its own success.
   if (fired) return;
+  // Nobody needs summoning to a machine someone is standing at -- or has just
+  // closed the door on and is about to restart. See AFTER_INTERVENTION_S.
+  if (attended || Date.now() < alertHoldUntil) return;
   // A paused or finished clip is not a stopped machine.
   if (source === "file" && (vid.paused || vid.ended)) return;
 
@@ -1541,7 +1710,7 @@ function clearAlarm() {
   stopSaying();
 }
 
-$("alertAck").onclick = () => {
+function acknowledge() {
   clearAlarm();
   const wasStop = alertKind === "stopped";
   if (!wasStop) log?.add(Shift.EV.DEPLETION_ACKNOWLEDGED);
@@ -1559,7 +1728,9 @@ $("alertAck").onclick = () => {
     }
   }
   hideAlertScreen();
-};
+}
+$("alertAck").onclick = acknowledge;
+$("alertAttend").onclick = () => { if (alertKind) acknowledge(); startIntervention(); };
 
 document.addEventListener("visibilitychange", () => {
   if (running && document.visibilityState === "visible")
@@ -1635,6 +1806,7 @@ function paintTally() {
     set("tScrap", c.scrapBobbins || 0);
     set("tDone", c.bobbinsCompleted || 0);
     set("tIdle", mmss(c.idleSeconds || 0));
+    $("tTotalIdle").textContent = mmss(c.idleSeconds || 0);
     $("tShift").disabled = false;
     return;
   }
@@ -1642,6 +1814,9 @@ function paintTally() {
   set("tScrap", shift.scrapBobbins);
   set("tDone", shift.bobbinsCompleted);
   set("tIdle", mmss(shift.idleDuringBobbinBuildSeconds));
+  // stopped during a build, plus stopped between bobbins; time away is in
+  // neither, which is what makes it the figure to read from the machine
+  $("tTotalIdle").textContent = mmss(shift.totalIdleSeconds);
   $("tShift").disabled = true;          // named at the start, fixed for the shift
 }
 setInterval(() => { if (log) paintTally(); }, 2000);
@@ -1667,10 +1842,133 @@ $("bobbinDone").onclick = () => {
     (b.utilisation !== null ? ` (${b.utilisation}% used).` : ".");
 };
 
+/* ---- operator intervention ----------------------------------------------
+   See INTERVENTION_MAX_S for what it does and why it ends itself. Each one is
+   a pair of events in the log, so time spent at the machine is a figure of its
+   own (attendedSeconds) rather than something inferred from the camera --
+   which is the one thing that cannot be trusted while someone is in front of it. */
+function startIntervention() {
+  if (!log || attendedSince !== null) return;
+  attendedSince = Date.now();
+  log.add(Shift.EV.INTERVENTION_STARTED);
+  if (alertKind) acknowledge();         // the operator is here; the alert has done its job
+  /* The door is opening, and the machine cannot run with it open. If the
+     detector still thinks it is running, what it is seeing from here on is the
+     operator -- so the stop is recorded now, rather than whenever their hands
+     happen to go still. */
+  if (machineMoving) {
+    machineMoving = false;
+    log.add(Shift.EV.MOTION_STOPPED,
+            { pct: +clamped.toFixed(1), outside: null, by: "intervention" });
+  }
+  movingFor = 0;
+  attendTimer = setTimeout(() => endIntervention("timeout"), INTERVENTION_MAX_S * 1000);
+  attendTicker = setInterval(paintIntervention, 1000);
+  $("attendNote").className = "note warn";
+  $("attendNote").textContent = "Operator at the machine — the camera is ignored. " +
+    "Press again once the door is shut, or Reset after a swap.";
+  paintIntervention();
+}
+
+function endIntervention(by) {
+  if (attendedSince === null) return;
+  const lasted = Math.round((Date.now() - attendedSince) / 1000);
+  log?.add(Shift.EV.INTERVENTION_ENDED, { by });
+  attendedSince = null;
+  clearTimeout(attendTimer); clearInterval(attendTicker); attendTimer = attendTicker = null;
+  alertHoldUntil = Date.now() + AFTER_INTERVENTION_S * 1000;
+  $("attendNote").className = "note" + (by === "timeout" ? " warn" : "");
+  $("attendNote").textContent = by === "timeout"
+    ? `Ended on its own after ${elapsed(INTERVENTION_MAX_S)} — press again if you are still at the machine.`
+    : `Intervention ended after ${mmss(lasted)}. Watching the machine again.`;
+  if (by === "timeout") {
+    if (audio) { const t = audio.currentTime; beep(t, 660, 0.15); beep(t + 0.25, 660, 0.15); }
+    speak("Operator intervention ended. Press again if you are still at the machine.");
+  }
+  paintIntervention();
+}
+
+function paintIntervention() {
+  const on = attendedSince !== null, b = $("attendBtn");
+  b.disabled = !log || awaySince !== null;
+  b.classList.toggle("on", on);
+  b.textContent = on ? "Operator intervention: ON" : "Operator intervention";
+  $("attendBanner").classList.toggle("hidden", !on);
+  if (on) $("attendLeft").textContent = mmss(Math.max(0,
+    Math.ceil(INTERVENTION_MAX_S - (Date.now() - attendedSince) / 1000))) + " left";
+}
+$("attendBtn").onclick = () =>
+  attendedSince === null ? startIntervention() : endIntervention("button");
+
+/* ---- operator away -------------------------------------------------------
+   Different from an intervention, and the difference is the whole point.
+   An intervention says someone is at the machine and the camera cannot be
+   believed; the shift clock keeps running, because the machine is standing
+   still on company time and that is worth knowing. Away says nobody is here
+   at all: the app stops watching and stops counting, and the time is left out
+   of every figure rather than counted as idle. A tea break is not a stoppage
+   the machine is answerable for.
+
+   No timeout, by the operator's decision on 15 Oct. A timeout exists to stop
+   the camera being blinded indefinitely, which is a real risk while someone
+   is working in front of it; here nothing is being recorded either way, and
+   an app that quietly started counting again while the floor was empty would
+   put the break into the idle total -- the exact thing this prevents. It ends
+   when someone comes back and says so. */
+function startAway() {
+  if (!log || awaySince !== null) return;
+  /* The machine cannot be left running, so record the stop at the press --
+     the same reasoning as an intervention, and it keeps the away window
+     inside a stopped stretch where it is simply cut out. */
+  if (machineMoving) {
+    machineMoving = false;
+    log.add(Shift.EV.MOTION_STOPPED, { pct: +clamped.toFixed(1), outside: null, by: "away" });
+  }
+  endIntervention("away");            // nobody can be at a machine they left
+  if (alertKind) acknowledge();
+  awaySince = Date.now();
+  log.add(Shift.EV.AWAY_STARTED);
+  stopRun();                          // the camera is not read again until they return
+  $("awayNote").className = "note warn";
+  $("awayNote").textContent = "Nobody at the machine — monitoring and the clock are stopped. " +
+    "Press again when you are back.";
+  paintAway();
+}
+
+function endAway(by) {
+  if (awaySince === null) return;
+  const lasted = Math.round((Date.now() - awaySince) / 1000);
+  log?.add(Shift.EV.AWAY_ENDED, { by });
+  awaySince = null;
+  $("awayNote").className = "note";
+  $("awayNote").textContent = `Away for ${mmss(lasted)} — not counted as idle.`;
+  paintAway();
+  // back to watching, with the baseline this bobbin already has
+  if (by !== "end") resumeShift();
+}
+
+function paintAway() {
+  const on = awaySince !== null, b = $("awayBtn");
+  b.disabled = !log;
+  b.classList.toggle("awayOn", on);
+  b.textContent = on ? "Operator away: ON — press when back" : "Operator away";
+  $("awayBanner").classList.toggle("hidden", !on);
+  /* Nothing is recorded while away, so nothing that records anything is
+     offered. End is the exception: a shift must always be closeable. These
+     are set both ways here -- a control disabled by one state and re-enabled
+     by another is how a button ends up dead for the rest of a shift. */
+  $("reset").disabled = on;
+  $("bobbinDone").disabled = on || !log;
+  paintIntervention();
+}
+$("awayBtn").onclick = () => awaySince === null ? startAway() : endAway("button");
+
 /* End closes the shift and files it. Only this button does -- switching source
    or losing the camera stops the run without ending anything. */
 function endShift() {
   if (log) {
+    endIntervention("end");
+    endAway("end");
     log.add(Shift.EV.SHIFT_ENDED, { peakPct: +clamped.toFixed(1) });
     const { shift } = log.derive({ now: Date.now() });
     /* Keep the events, not just the summary. The rules that turn one into the
@@ -1723,6 +2021,8 @@ function download(name, text, type) {
 }
 
 paintTally();
+paintIntervention();
+paintAway();
 
 $("verChip").textContent = `v${VERSION}` + (BUILD === "dev" ? " dev" : ` · ${BUILD}`);
 

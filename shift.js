@@ -25,8 +25,8 @@ const EV = {
   SHIFT_ENDED:            "shift.ended",           // { peakPct }
   RUN_STARTED:            "run.started",
   RUN_RESET:              "run.reset",             // { peakPct } -- of the run it closes
-  MOTION_STARTED:         "motion.started",        // { level }
-  MOTION_STOPPED:         "motion.stopped",
+  MOTION_STARTED:         "motion.started",        // { level, outside }
+  MOTION_STOPPED:         "motion.stopped",        // { pct, outside }
   DEPLETION_ALERTED:      "depletion.alerted",     // { pct }
   DEPLETION_ACKNOWLEDGED: "depletion.acknowledged",
   STOP_ALERTED:           "stop.alerted",
@@ -34,6 +34,10 @@ const EV = {
   BOBBIN_COMPLETED:       "bobbin.completed",      // { peakPct }
   CALIBRATION_APPLIED:    "calibration.applied",   // { baseline, ceiling, creamWarm }
   CARRIED_OVER:           "carried.over",          // { bobbinsCompleted, scrapBobbins, idleSeconds }
+  INTERVENTION_STARTED:   "intervention.started",  // operator at the machine, door open
+  INTERVENTION_ENDED:     "intervention.ended",    // { by: "button" | "reset" | "timeout" | "end" }
+  AWAY_STARTED:           "away.started",          // nobody here; the app stops watching
+  AWAY_ENDED:             "away.ended",            // { by: "button" | "end" }
 };
 
 /* A run that ended with no alert is either one we failed to warn about or one
@@ -61,34 +65,48 @@ function median(xs) {
 }
 
 /* Motion intervals across the whole shift. Built once and then sliced per
- * run, rather than per run, so a run boundary can be snapped onto them. */
+ * run, rather than per run, so a run boundary can be snapped onto them. Each
+ * keeps the exposure reading from the moment it stopped -- the only thing that
+ * tells an early stop at 40% apart from the real one at 99%. */
 function motionIntervals(events, endT) {
   const out = [];
   let open = null;
   for (const e of events) {
     if (e.type === EV.MOTION_STARTED && open === null) open = e.t;
-    else if (e.type === EV.MOTION_STOPPED && open !== null) { out.push({ start: open, end: e.t }); open = null; }
+    else if (e.type === EV.MOTION_STOPPED && open !== null) {
+      // `by` says the app recorded this stop because a button was pressed
+      // rather than because the bobbin went still -- which is the difference
+      // between a machine fault and an operator walking off.
+      out.push({ start: open, end: e.t, stopPct: typeof e.pct === "number" ? e.pct : null,
+                 stopBy: e.by ?? null });
+      open = null;
+    }
   }
-  if (open !== null) out.push({ start: open, end: endT, openEnded: true });
+  if (open !== null)
+    out.push({ start: open, end: endT, openEnded: true, stopPct: null, stopBy: null });
   return out;
 }
 
 /* Where one scrap bobbin ends and the next begins.
  *
  * Reset is the operator saying a swap happened, which is true however the last
- * bobbin ended -- depleted, abandoned mid-fault, tow broken. But it is pressed
- * a few seconds AFTER the next bobbin is already turning, so the press is not
- * the moment. The boundary snaps to the machine: close at the last stop before
- * the press, open at the start that followed it. Those few seconds then land in
- * the new run instead of being added to the old one.
+ * bobbin ended -- depleted, abandoned mid-fault, tow broken. The bobbin closes
+ * at the last stop before Reset, and the next one opens AT Reset. Everything
+ * between is the swap.
  *
- * A Reset with no stop in between is a mis-press; the boundary falls where it
- * was pressed, which keeps the runs in order and loses nothing. */
+ * Opening at Reset was the operator's call on 15 Oct. The earlier rule opened
+ * the next run when motion resumed, which credited the seconds between
+ * restarting the machine and reaching the tablet as running. Opening at Reset
+ * counts those seconds as swap instead, and buys something worth more: nothing
+ * the camera sees during a swap -- hands, the door, re-threading -- can change
+ * how long the swap took, because the swap is bounded by the stop and a button.
+ *
+ * A Reset with no stop before it is a mis-press; both edges fall on the press,
+ * which keeps runs in order and loses nothing. */
 function boundary(closer, intervals) {
   const before = intervals.filter(i => i.end <= closer.t);
   const closeAt = before.length ? before[before.length - 1].end : closer.t;
-  const resumed = intervals.find(i => i.start > closeAt && i.start <= closer.t);
-  return { closeAt, openAt: resumed ? resumed.start : closer.t };
+  return { closeAt, openAt: closer.t };
 }
 
 function overlap(interval, from, to) {
@@ -96,11 +114,30 @@ function overlap(interval, from, to) {
   return b > a ? { start: a, end: b } : null;
 }
 
-/* events -> { shift, runs }. Pure: no clock, no storage, no DOM.
+const lengthOf = xs => sum(xs.map(x => x.end - x.start));
+
+/* Intervals with windows cut out of them. */
+function subtract(intervals, windows) {
+  let out = intervals.map(i => ({ ...i }));
+  for (const w of windows) {
+    const next = [];
+    for (const i of out) {
+      if (w.end <= i.start || w.start >= i.end) { next.push(i); continue; }
+      // the left piece no longer ends where the machine stopped, so it keeps
+      // neither the reading at that stop nor the reason for it
+      if (w.start > i.start) next.push({ ...i, end: w.start, stopPct: null, stopBy: null });
+      if (w.end < i.end) next.push({ ...i, start: w.end });
+    }
+    out = next;
+  }
+  return out;
+}
+
+/* events -> { shift, bobbins, runs }. Pure: no clock, no storage, no DOM.
  * `now` is only used to close a shift that is still open. */
 function derive(events, { now = null, missAbovePct = MISS_ABOVE_PCT } = {}) {
   const ev = [...events].sort((a, b) => a.t - b.t);
-  if (!ev.length) return { shift: null, runs: [] };
+  if (!ev.length) return { shift: null, bobbins: [], runs: [] };
 
   const started = ev.find(e => e.type === EV.SHIFT_STARTED);
   const ended = ev.find(e => e.type === EV.SHIFT_ENDED);
@@ -108,119 +145,195 @@ function derive(events, { now = null, missAbovePct = MISS_ABOVE_PCT } = {}) {
   const endedAt = ended ? ended.t : null;
   const horizon = endedAt ?? now ?? ev[ev.length - 1].t;
 
-  const intervals = motionIntervals(ev, horizon);
+  /* Operator away: the shift is open but nobody is here, so the app is not
+     watching and nothing that happens counts. Unlike an intervention, which
+     only says the camera cannot be believed, this stops the clock -- away time
+     is neither running nor idle, and it is taken out of every figure below
+     rather than counted as a kind of its own. A tea break is not a stoppage
+     the machine is responsible for, and leaving it in the idle total would
+     make the one number the operator is judged on depend on their breaks. */
+  const away = [];
+  let openA = null;
+  for (const e of ev) {
+    if (e.type === EV.AWAY_STARTED && !openA) openA = e;
+    else if (e.type === EV.AWAY_ENDED && openA) { away.push({ start: openA.t, end: e.t }); openA = null; }
+  }
+  if (openA) away.push({ start: openA.t, end: horizon, open: true });
+
+  const raw = subtract(motionIntervals(ev, horizon), away);
   const closers = ev.filter(e => CLOSERS.includes(e.type));
+  const cuts = closers.map(c => ({ closer: c, ...boundary(c, raw) }));
 
-  /* Time when NO bobbin is being made: from one being finished until the
-     machine turns again on the next. Changing the bobbin over is part of it,
-     and so is a forty-minute break before anyone comes back to start another.
+  /* A swap is bounded by a stop and a button press. Whatever moved inside one
+     was not the machine making a bobbin, so it is cut out of running time
+     everywhere -- per run, per completed bobbin and per shift alike. */
+  const swapWindows = cuts.filter(c => c.closer.type === EV.RUN_RESET)
+                          .map(c => ({ start: c.closeAt, end: c.closer.t }));
+  const running = subtract(raw, swapWindows);
 
-     Kept apart from idle because idle means the machine stopped while a bobbin
-     was being built -- a fault, or a scrap bobbin swap -- and that is a
-     different question from how long the line stood between bobbins. Lumping
-     them together made a shift look worse the more bobbins it finished.
+  /* Time after a bobbin is completed, when no bobbin is being made: from the
+     completion until the machine turns again on the next. Changing the bobbin
+     over is part of it, and so is a forty-minute break before anyone comes
+     back to start another. It is not idle-during-build, which means the
+     machine stopped while a bobbin was being made; lumping them together made
+     a shift look worse the more bobbins it finished.
 
      It only exists if the machine was ALREADY STOPPED when the bobbin was
-     called complete. An earlier version ran the window from the completion to
-     the next Reset, which on a completion pressed mid-run swallowed every fault
-     stop in between and zeroed the shift's idle time. If the machine is still
-     turning, nothing is being changed over yet.
+     called complete. An earlier version ran the window to the next Reset,
+     which on a completion pressed mid-run swallowed every fault stop in
+     between and zeroed the shift's idle time. If the machine is still turning,
+     nothing is being changed over yet. */
+  const rawGaps = [];
+  for (let i = 0; i < raw.length - 1; i++) rawGaps.push({ start: raw[i].end, end: raw[i + 1].start });
+  const lastRaw = raw[raw.length - 1];
+  if (lastRaw && !lastRaw.openEnded && lastRaw.end < horizon)
+    rawGaps.push({ start: lastRaw.end, end: horizon });     // stopped right up to now
 
-     Reported separately rather than discarded: time the machine spent stopped
-     has to land somewhere, or the figures stop adding up to the shift. */
-  const stoppedGaps = [];
-  for (let i = 0; i < intervals.length - 1; i++)
-    stoppedGaps.push({ start: intervals[i].end, end: intervals[i + 1].start });
-
-  const betweenBobbins = [];
+  const afterCompleteRaw = [];
   for (const c of ev.filter(e => e.type === EV.BOBBIN_COMPLETED)) {
-    const during = stoppedGaps.find(g => c.t >= g.start && c.t < g.end);
-    if (during) betweenBobbins.push({ start: c.t, end: during.end });
+    const during = rawGaps.find(g => c.t >= g.start && c.t < g.end);
+    if (during) afterCompleteRaw.push({ start: c.t, end: during.end });
   }
-  const betweenIn = (from, to) =>
-    sum(betweenBobbins.map(c => { const o = overlap(c, from, to); return o ? o.end - o.start : 0; }));
+  // away time is cut out here, so the two never overlap and net() can take
+  // both away without subtracting the same seconds twice
+  const afterComplete = subtract(afterCompleteRaw, away);
+  const within = (windows, from, to) =>
+    sum(windows.map(w => { const o = overlap(w, from, to); return o ? o.end - o.start : 0; }));
+  const afterIn = (from, to) => within(afterComplete, from, to);
+  const awayIn = (from, to) => within(away, from, to);
+  // a stopped stretch, less after-completion time and less time nobody was here
+  const net = (from, to) => Math.max(0, (to - from) - afterIn(from, to) - awayIn(from, to));
 
-  // a stopped stretch, with any between-bobbins time taken out of it
-  const netGap = (from, to) => Math.max(0, (to - from) - betweenIn(from, to));
+  /* Operator intervention: the door is open and someone is at the machine.
+     Each window keeps how it ended, so ones that ran out on the timeout --
+     where the operator may well have walked away first -- can be told apart
+     from ones they closed themselves. */
+  const attended = [];
+  let openI = null;
+  for (const e of ev) {
+    if (e.type === EV.INTERVENTION_STARTED && !openI) openI = e;
+    else if (e.type === EV.INTERVENTION_ENDED && openI) {
+      attended.push({ start: openI.t, end: e.t, by: e.by ?? null });
+      openI = null;
+    }
+  }
+  if (openI) attended.push({ start: openI.t, end: horizon, by: null, open: true });
+  const attendedIn = (from, to) => within(subtract(attended, away), from, to);
 
-  /* One run per closer, plus a trailing open run if the shift is still going.
-   * Runs are cut on the motion timeline; the closers only say where. */
-  const cuts = closers.map(c => ({ closer: c, ...boundary(c, intervals) }));
+  const idle = [];            // every stopped period counted as idle during a build
   const runs = [];
   let openAt = (ev.find(e => e.type === EV.RUN_STARTED) || { t: startedAt }).t;
 
-  const build = (from, to, closer) => {
+  const build = (from, to, cut) => {
+    const closer = cut ? cut.closer : null;
     const mine = ev.filter(e => e.t >= from && e.t <= to);
-    const spans = intervals.map(i => overlap(i, from, to)).filter(Boolean);
+    const spans = running.map(i => {
+      const o = overlap(i, from, to);
+      return o ? { ...o, stopPct: o.end === i.end ? i.stopPct : null,
+                   stopBy: o.end === i.end ? i.stopBy : null } : null;
+    }).filter(Boolean);
     const alert = mine.find(e => e.type === EV.DEPLETION_ALERTED);
     const ack = mine.find(e => e.type === EV.DEPLETION_ACKNOWLEDGED);
     const lastStop = spans.length ? spans[spans.length - 1].end : null;
+    const stoppedAtEnd = spans.length > 0 && (!!closer || lastStop < to);
     const peakPct = closer && typeof closer.peakPct === "number" ? closer.peakPct
                   : alert ? alert.pct : null;
 
-    /* Every motion gap inside a run is the machine stopping and being
-     * restarted on the same bobbin -- a tow-width fault, in practice. The run's
-     * own final stop is not one of them. */
-    const faultGaps = spans.slice(0, -1).map((s, i) => netGap(s.end, spans[i + 1].start));
+    /* Every stop inside a run is the machine halting and restarting on the same
+       scrap bobbin. Before the depletion alert that is a tow-width fault. After
+       it, it is the operator stopping early -- stopped at 40% in the rush, then
+       carried on to 99% -- which is a pause, not a fault, and is counted apart
+       so the fault figure stays a measure of the machine. */
+    const stops = [];
+    for (let i = 0; i < spans.length - 1; i++) {
+      const g = { start: spans[i].end, end: spans[i + 1].start };
+      /* A stop the app recorded because Operator away was pressed is the
+         operator stopping the machine to leave. The break itself is already
+         cut out of the seconds; what is left is the machine standing still
+         before and after it, which is idle -- but calling it a fault would
+         put every tea break into the figure that measures the machine. */
+      const kind = spans[i].stopBy === "away" ? "away"
+                 : alert && g.start >= alert.t ? "pause" : "fault";
+      stops.push({ ...g, kind, seconds: secs(net(g.start, g.end)), exposurePct: spans[i].stopPct });
+      idle.push({ ...g, kind });
+    }
+    let swapSeconds = null;
+    if (closer && closer.type === EV.RUN_RESET) {
+      const w = { start: cut.closeAt, end: closer.t };
+      swapSeconds = secs(net(w.start, w.end));
+      stops.push({ ...w, kind: "swap", seconds: swapSeconds,
+                   exposurePct: spans.length ? spans[spans.length - 1].stopPct : null });
+      idle.push({ ...w, kind: "swap" });
+    } else if (!closer && spans.length && lastStop < to) {
+      // stopped right now, on a bobbin still in progress: counted live, and
+      // recomputed exactly once Reset says what kind of stop it was
+      const w = { start: lastStop, end: to };
+      stops.push({ ...w, kind: "current", seconds: secs(net(w.start, w.end)),
+                   exposurePct: spans[spans.length - 1].stopPct });
+      idle.push({ ...w, kind: "current" });
+    }
+    const of = kind => stops.filter(x => x.kind === kind);
+    const total = xs => secs(sum(xs.map(x => net(x.start, x.end))));
 
     return {
       seq: runs.length + 1,
       startedAt: from,
       endedAt: to,
-      runSeconds: secs(sum(spans.map(s => s.end - s.start))),
+      runSeconds: secs(lengthOf(spans)),
       peakPct,
       alertedAt: alert ? alert.t : null,
       alertPct: alert ? alert.pct : null,
-      warningSeconds: alert && lastStop !== null ? secs(lastStop - alert.t) : null,
+      // to the LAST stop: an early stop at 40% is not the tow running out, and
+      // measuring to it would flatter the system
+      warningSeconds: alert && stoppedAtEnd ? secs(lastStop - alert.t) : null,
       ackSeconds: alert && ack ? secs(ack.t - alert.t) : null,
       endedBy: alert ? "depleted"
              : (peakPct !== null && peakPct >= missAbovePct) ? "missed" : "abandoned",
-      faultStops: faultGaps.length,
-      faultStopSeconds: secs(sum(faultGaps)),
+      faultStops: of("fault").length,
+      faultStopSeconds: total(of("fault")),
+      depletionPauses: of("pause").length,
+      depletionPauseSeconds: total(of("pause")),
+      swapSeconds,
+      stops,
       open: !closer,
     };
   };
 
   for (const cut of cuts) {
-    runs.push(build(openAt, cut.closeAt, cut.closer));
+    runs.push(build(openAt, cut.closeAt, cut));
     openAt = cut.openAt;
   }
   // a run in progress: everything after the last boundary
   if (!endedAt && openAt < horizon) runs.push(build(openAt, horizon, null));
 
-  // idle is the gap between one run's last motion and the next run's first
-  for (let i = 0; i < runs.length - 1; i++) {
-    const next = intervals.find(x => x.start >= runs[i].endedAt);
-    runs[i].idleAfterSeconds = next ? secs(netGap(runs[i].endedAt, next.start)) : null;
-  }
-  if (runs.length) runs[runs.length - 1].idleAfterSeconds = null;
+  const idleIn = (from, to) =>
+    sum(idle.map(p => { const o = overlap(p, from, to); return o ? net(o.start, o.end) : 0; }));
 
   /* Per completed bobbin. A shift finishes as many as it finishes, and the
      operator wants to know what each one cost -- so the shift is cut at every
-     completion and the motion inside each piece is measured.
-     
-     Cut on the motion timeline rather than on whole runs, because a bobbin
-     usually completes part-way through a scrap bobbin: the run feeding it
-     carries on afterwards and its time belongs to both sides of the line. */
+     completion and what happened inside each piece is measured. Cut on the
+     timeline rather than on whole runs, because a bobbin usually completes
+     part-way through a scrap bobbin whose time belongs to both sides. */
   const completions = ev.filter(e => e.type === EV.BOBBIN_COMPLETED);
   const bobbins = completions.map((c, i) => {
     const from = i ? completions[i - 1].t : startedAt;
     const to = c.t;
-    const spans = intervals.map(x => overlap(x, from, to)).filter(Boolean);
-    const mine = stoppedGaps.filter(g => g.start >= from && g.start < to);
-    const run = sum(spans.map(x => x.end - x.start));
-    const idle = sum(mine.map(g => netGap(g.start, g.end)));
-    const between = betweenIn(from, to);
+    const run = lengthOf(running.map(x => overlap(x, from, to)).filter(Boolean));
+    const idleMs = idleIn(from, to);
     return {
       seq: i + 1,
       startedAt: from, endedAt: to,
-      elapsedSeconds: secs(to - from),
+      // elapsed is wall clock less time nobody was here, so a bobbin that
+      // spanned a break is not reported as having taken an hour longer
+      elapsedSeconds: secs(to - from - awayIn(from, to)),
       runSeconds: secs(run),
-      idleDuringBobbinBuildSeconds: secs(idle),
-      idleAfterBobbinCompleteSeconds: secs(between),
+      idleDuringBobbinBuildSeconds: secs(idleMs),
+      idleAfterBobbinCompleteSeconds: secs(afterIn(from, to)),
+      attendedSeconds: secs(attendedIn(from, to)),
+      awaySeconds: secs(awayIn(from, to)),
       // a scrap bobbin counts against whichever bobbin it was used up feeding
       scrapBobbins: runs.filter(r => !r.open && r.endedAt > from && r.endedAt <= to).length,
-      utilisation: run + idle > 0 ? Math.round((1000 * run) / (run + idle)) / 10 : null,
+      utilisation: run + idleMs > 0 ? Math.round((1000 * run) / (run + idleMs)) / 10 : null,
     };
   });
 
@@ -242,7 +355,8 @@ function derive(events, { now = null, missAbovePct = MISS_ABOVE_PCT } = {}) {
   bobbins.forEach(b => { b.seq += carried.bobbinsCompleted; });
   if (bobbins.length) {
     bobbins[0].scrapBobbins += carried.scrapBobbins;
-    bobbins[0].idleDuringBobbinBuildSeconds = Math.round((bobbins[0].idleDuringBobbinBuildSeconds + carried.idleSeconds) * 10) / 10;
+    bobbins[0].idleDuringBobbinBuildSeconds =
+      Math.round((bobbins[0].idleDuringBobbinBuildSeconds + carried.idleSeconds) * 10) / 10;
     const r = bobbins[0].runSeconds, i = bobbins[0].idleDuringBobbinBuildSeconds;
     bobbins[0].utilisation = r + i > 0 ? Math.round((1000 * r) / (r + i)) / 10 : null;
   }
@@ -250,24 +364,35 @@ function derive(events, { now = null, missAbovePct = MISS_ABOVE_PCT } = {}) {
   const closed = runs.filter(r => !r.open);
   const warnings = runs.map(r => r.warningSeconds).filter(x => x !== null);
   const runSec = sum(runs.map(r => r.runSeconds));
-  const idleSec = sum(runs.map(r => r.idleAfterSeconds || 0))
-                + sum(runs.map(r => r.faultStopSeconds)) + carried.idleSeconds;
+  const idleSec = secs(sum(idle.map(p => net(p.start, p.end)))) + carried.idleSeconds;
+  const r1 = x => Math.round(x * 10) / 10;
 
   return {
     shift: {
       shiftNo: started ? started.shiftNo : null,
       name: started ? (started.name ?? null) : null,
       startedAt, endedAt,
-      bobbinsCompleted: ev.filter(e => e.type === EV.BOBBIN_COMPLETED).length
-                        + (ev.filter(e => e.type === EV.CARRIED_OVER).pop()?.bobbinsCompleted || 0),
+      bobbinsCompleted: completions.length + carried.bobbinsCompleted,
       scrapBobbins: closed.length + carried.scrapBobbins,
       carried,
-      totalRunSeconds: Math.round(runSec * 10) / 10,
-      idleDuringBobbinBuildSeconds: Math.round(idleSec * 10) / 10,
+      totalRunSeconds: r1(runSec),
+      idleDuringBobbinBuildSeconds: r1(idleSec),
       utilisation: runSec + idleSec > 0 ? Math.round((1000 * runSec) / (runSec + idleSec)) / 10 : null,
       faultStopCount: sum(runs.map(r => r.faultStops)),
-      faultStopSeconds: Math.round(sum(runs.map(r => r.faultStopSeconds)) * 10) / 10,
-      idleAfterBobbinCompleteSeconds: secs(betweenIn(startedAt, horizon)),
+      faultStopSeconds: r1(sum(runs.map(r => r.faultStopSeconds))),
+      depletionPauseCount: sum(runs.map(r => r.depletionPauses)),
+      depletionPauseSeconds: r1(sum(runs.map(r => r.depletionPauseSeconds))),
+      swapSeconds: r1(sum(runs.map(r => r.swapSeconds || 0))),
+      idleAfterBobbinCompleteSeconds: secs(afterIn(startedAt, horizon)),
+      /* Every second the machine stood still while someone was here to see it:
+         the one the operator asked to have on screen. Away time is not in it
+         by construction -- net() has already taken it out of both parts. */
+      totalIdleSeconds: r1(idleSec + secs(afterIn(startedAt, horizon))),
+      awaySeconds: secs(awayIn(startedAt, horizon)),
+      awayPeriods: away.length,
+      attendedSeconds: secs(attendedIn(startedAt, horizon)),
+      interventions: attended.length,
+      interventionsTimedOut: attended.filter(w => w.by === "timeout").length,
       missedAlerts: runs.filter(r => r.endedBy === "missed").length,
       abandoned: runs.filter(r => r.endedBy === "abandoned").length,
       medianWarningSeconds: median(warnings),
@@ -279,23 +404,28 @@ function derive(events, { now = null, missAbovePct = MISS_ABOVE_PCT } = {}) {
 
 /* Rows a spreadsheet can open. Data that cannot leave the tablet is not data. */
 function toCSV(runs, shift) {
-  const cols = ["shift", "shiftName", "bobbin", "runSeconds", "idleAfterSeconds", "peakPct",
-                "warningSeconds", "ackSeconds", "endedBy", "faultStops", "faultStopSeconds"];
+  const cols = ["shift", "shiftName", "bobbin", "runSeconds", "swapSeconds", "peakPct",
+                "warningSeconds", "ackSeconds", "endedBy", "faultStops", "faultStopSeconds",
+                "depletionPauses", "depletionPauseSeconds", "stopsAt"];
+  // "fault 12.0 / pause 40.1 / swap 99.2" -- no commas, so it survives as one cell
+  const stopsAt = r => (r.stops || []).filter(x => x.kind !== "current")
+    .map(x => `${x.kind} ${x.exposurePct ?? "?"}`).join(" / ");
   const rows = runs.map(r => [
     shift ? shift.shiftNo : "", shift ? (shift.name ?? "") : "",
-    r.seq, r.runSeconds, r.idleAfterSeconds ?? "",
+    r.seq, r.runSeconds, r.swapSeconds ?? "",
     r.peakPct ?? "", r.warningSeconds ?? "", r.ackSeconds ?? "", r.endedBy,
-    r.faultStops, r.faultStopSeconds]);
+    r.faultStops, r.faultStopSeconds, r.depletionPauses, r.depletionPauseSeconds, stopsAt(r)]);
   return [cols.join(","), ...rows.map(r => r.join(","))].join("\n");
 }
 
 function bobbinsCSV(bobbins, shift) {
-  const cols = ["shift", "shiftName", "completedBobbin", "elapsedSeconds",
-                "runSeconds", "idleDuringBobbinBuildSeconds", "idleAfterBobbinCompleteSeconds", "scrapBobbins",
-                "utilisationPct"];
+  const cols = ["shift", "shiftName", "completedBobbin", "elapsedSeconds", "runSeconds",
+                "idleDuringBobbinBuildSeconds", "idleAfterBobbinCompleteSeconds",
+                "attendedSeconds", "awaySeconds", "scrapBobbins", "utilisationPct"];
   const rows = bobbins.map(b => [
     shift ? shift.shiftNo : "", shift ? (shift.name ?? "") : "", b.seq,
-    b.elapsedSeconds, b.runSeconds, b.idleDuringBobbinBuildSeconds, b.idleAfterBobbinCompleteSeconds,
+    b.elapsedSeconds, b.runSeconds, b.idleDuringBobbinBuildSeconds,
+    b.idleAfterBobbinCompleteSeconds, b.attendedSeconds, b.awaySeconds ?? 0,
     b.scrapBobbins, b.utilisation ?? ""]);
   return [cols.join(","), ...rows.map(r => r.join(","))].join("\n");
 }
