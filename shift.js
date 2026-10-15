@@ -36,8 +36,6 @@ const EV = {
   CARRIED_OVER:           "carried.over",          // { bobbinsCompleted, scrapBobbins, idleSeconds }
   INTERVENTION_STARTED:   "intervention.started",  // operator at the machine, door open
   INTERVENTION_ENDED:     "intervention.ended",    // { by: "button" | "reset" | "timeout" | "end" }
-  AWAY_STARTED:           "away.started",          // nobody here; the app stops watching
-  AWAY_ENDED:             "away.ended",            // { by: "button" | "end" }
 };
 
 /* A run that ended with no alert is either one we failed to warn about or one
@@ -74,16 +72,11 @@ function motionIntervals(events, endT) {
   for (const e of events) {
     if (e.type === EV.MOTION_STARTED && open === null) open = e.t;
     else if (e.type === EV.MOTION_STOPPED && open !== null) {
-      // `by` says the app recorded this stop because a button was pressed
-      // rather than because the bobbin went still -- which is the difference
-      // between a machine fault and an operator walking off.
-      out.push({ start: open, end: e.t, stopPct: typeof e.pct === "number" ? e.pct : null,
-                 stopBy: e.by ?? null });
+      out.push({ start: open, end: e.t, stopPct: typeof e.pct === "number" ? e.pct : null });
       open = null;
     }
   }
-  if (open !== null)
-    out.push({ start: open, end: endT, openEnded: true, stopPct: null, stopBy: null });
+  if (open !== null) out.push({ start: open, end: endT, openEnded: true, stopPct: null });
   return out;
 }
 
@@ -123,9 +116,7 @@ function subtract(intervals, windows) {
     const next = [];
     for (const i of out) {
       if (w.end <= i.start || w.start >= i.end) { next.push(i); continue; }
-      // the left piece no longer ends where the machine stopped, so it keeps
-      // neither the reading at that stop nor the reason for it
-      if (w.start > i.start) next.push({ ...i, end: w.start, stopPct: null, stopBy: null });
+      if (w.start > i.start) next.push({ ...i, end: w.start, stopPct: null });
       if (w.end < i.end) next.push({ ...i, start: w.end });
     }
     out = next;
@@ -145,22 +136,7 @@ function derive(events, { now = null, missAbovePct = MISS_ABOVE_PCT } = {}) {
   const endedAt = ended ? ended.t : null;
   const horizon = endedAt ?? now ?? ev[ev.length - 1].t;
 
-  /* Operator away: the shift is open but nobody is here, so the app is not
-     watching and nothing that happens counts. Unlike an intervention, which
-     only says the camera cannot be believed, this stops the clock -- away time
-     is neither running nor idle, and it is taken out of every figure below
-     rather than counted as a kind of its own. A tea break is not a stoppage
-     the machine is responsible for, and leaving it in the idle total would
-     make the one number the operator is judged on depend on their breaks. */
-  const away = [];
-  let openA = null;
-  for (const e of ev) {
-    if (e.type === EV.AWAY_STARTED && !openA) openA = e;
-    else if (e.type === EV.AWAY_ENDED && openA) { away.push({ start: openA.t, end: e.t }); openA = null; }
-  }
-  if (openA) away.push({ start: openA.t, end: horizon, open: true });
-
-  const raw = subtract(motionIntervals(ev, horizon), away);
+  const raw = motionIntervals(ev, horizon);
   const closers = ev.filter(e => CLOSERS.includes(e.type));
   const cuts = closers.map(c => ({ closer: c, ...boundary(c, raw) }));
 
@@ -189,20 +165,16 @@ function derive(events, { now = null, missAbovePct = MISS_ABOVE_PCT } = {}) {
   if (lastRaw && !lastRaw.openEnded && lastRaw.end < horizon)
     rawGaps.push({ start: lastRaw.end, end: horizon });     // stopped right up to now
 
-  const afterCompleteRaw = [];
+  const afterComplete = [];
   for (const c of ev.filter(e => e.type === EV.BOBBIN_COMPLETED)) {
     const during = rawGaps.find(g => c.t >= g.start && c.t < g.end);
-    if (during) afterCompleteRaw.push({ start: c.t, end: during.end });
+    if (during) afterComplete.push({ start: c.t, end: during.end });
   }
-  // away time is cut out here, so the two never overlap and net() can take
-  // both away without subtracting the same seconds twice
-  const afterComplete = subtract(afterCompleteRaw, away);
   const within = (windows, from, to) =>
     sum(windows.map(w => { const o = overlap(w, from, to); return o ? o.end - o.start : 0; }));
   const afterIn = (from, to) => within(afterComplete, from, to);
-  const awayIn = (from, to) => within(away, from, to);
-  // a stopped stretch, less after-completion time and less time nobody was here
-  const net = (from, to) => Math.max(0, (to - from) - afterIn(from, to) - awayIn(from, to));
+  // a stopped stretch, with any after-completion time taken out of it
+  const net = (from, to) => Math.max(0, (to - from) - afterIn(from, to));
 
   /* Operator intervention: the door is open and someone is at the machine.
      Each window keeps how it ended, so ones that ran out on the timeout --
@@ -218,7 +190,7 @@ function derive(events, { now = null, missAbovePct = MISS_ABOVE_PCT } = {}) {
     }
   }
   if (openI) attended.push({ start: openI.t, end: horizon, by: null, open: true });
-  const attendedIn = (from, to) => within(subtract(attended, away), from, to);
+  const attendedIn = (from, to) => within(attended, from, to);
 
   const idle = [];            // every stopped period counted as idle during a build
   const runs = [];
@@ -229,8 +201,7 @@ function derive(events, { now = null, missAbovePct = MISS_ABOVE_PCT } = {}) {
     const mine = ev.filter(e => e.t >= from && e.t <= to);
     const spans = running.map(i => {
       const o = overlap(i, from, to);
-      return o ? { ...o, stopPct: o.end === i.end ? i.stopPct : null,
-                   stopBy: o.end === i.end ? i.stopBy : null } : null;
+      return o ? { ...o, stopPct: o.end === i.end ? i.stopPct : null } : null;
     }).filter(Boolean);
     const alert = mine.find(e => e.type === EV.DEPLETION_ALERTED);
     const ack = mine.find(e => e.type === EV.DEPLETION_ACKNOWLEDGED);
@@ -247,13 +218,7 @@ function derive(events, { now = null, missAbovePct = MISS_ABOVE_PCT } = {}) {
     const stops = [];
     for (let i = 0; i < spans.length - 1; i++) {
       const g = { start: spans[i].end, end: spans[i + 1].start };
-      /* A stop the app recorded because Operator away was pressed is the
-         operator stopping the machine to leave. The break itself is already
-         cut out of the seconds; what is left is the machine standing still
-         before and after it, which is idle -- but calling it a fault would
-         put every tea break into the figure that measures the machine. */
-      const kind = spans[i].stopBy === "away" ? "away"
-                 : alert && g.start >= alert.t ? "pause" : "fault";
+      const kind = alert && g.start >= alert.t ? "pause" : "fault";
       stops.push({ ...g, kind, seconds: secs(net(g.start, g.end)), exposurePct: spans[i].stopPct });
       idle.push({ ...g, kind });
     }
@@ -323,14 +288,11 @@ function derive(events, { now = null, missAbovePct = MISS_ABOVE_PCT } = {}) {
     return {
       seq: i + 1,
       startedAt: from, endedAt: to,
-      // elapsed is wall clock less time nobody was here, so a bobbin that
-      // spanned a break is not reported as having taken an hour longer
-      elapsedSeconds: secs(to - from - awayIn(from, to)),
+      elapsedSeconds: secs(to - from),
       runSeconds: secs(run),
       idleDuringBobbinBuildSeconds: secs(idleMs),
       idleAfterBobbinCompleteSeconds: secs(afterIn(from, to)),
       attendedSeconds: secs(attendedIn(from, to)),
-      awaySeconds: secs(awayIn(from, to)),
       // a scrap bobbin counts against whichever bobbin it was used up feeding
       scrapBobbins: runs.filter(r => !r.open && r.endedAt > from && r.endedAt <= to).length,
       utilisation: run + idleMs > 0 ? Math.round((1000 * run) / (run + idleMs)) / 10 : null,
@@ -384,12 +346,9 @@ function derive(events, { now = null, missAbovePct = MISS_ABOVE_PCT } = {}) {
       depletionPauseSeconds: r1(sum(runs.map(r => r.depletionPauseSeconds))),
       swapSeconds: r1(sum(runs.map(r => r.swapSeconds || 0))),
       idleAfterBobbinCompleteSeconds: secs(afterIn(startedAt, horizon)),
-      /* Every second the machine stood still while someone was here to see it:
-         the one the operator asked to have on screen. Away time is not in it
-         by construction -- net() has already taken it out of both parts. */
+      /* Every second the machine stood still: stopped during a build, plus
+         stopped between one bobbin and the next. The figure on screen. */
       totalIdleSeconds: r1(idleSec + secs(afterIn(startedAt, horizon))),
-      awaySeconds: secs(awayIn(startedAt, horizon)),
-      awayPeriods: away.length,
       attendedSeconds: secs(attendedIn(startedAt, horizon)),
       interventions: attended.length,
       interventionsTimedOut: attended.filter(w => w.by === "timeout").length,
@@ -421,12 +380,11 @@ function toCSV(runs, shift) {
 function bobbinsCSV(bobbins, shift) {
   const cols = ["shift", "shiftName", "completedBobbin", "elapsedSeconds", "runSeconds",
                 "idleDuringBobbinBuildSeconds", "idleAfterBobbinCompleteSeconds",
-                "attendedSeconds", "awaySeconds", "scrapBobbins", "utilisationPct"];
+                "attendedSeconds", "scrapBobbins", "utilisationPct"];
   const rows = bobbins.map(b => [
     shift ? shift.shiftNo : "", shift ? (shift.name ?? "") : "", b.seq,
     b.elapsedSeconds, b.runSeconds, b.idleDuringBobbinBuildSeconds,
-    b.idleAfterBobbinCompleteSeconds, b.attendedSeconds, b.awaySeconds ?? 0,
-    b.scrapBobbins, b.utilisation ?? ""]);
+    b.idleAfterBobbinCompleteSeconds, b.attendedSeconds, b.scrapBobbins, b.utilisation ?? ""]);
   return [cols.join(","), ...rows.map(r => r.join(","))].join("\n");
 }
 

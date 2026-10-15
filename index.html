@@ -88,10 +88,6 @@
   .attend b { font-variant-numeric:tabular-nums; }
   button.attendBtn { font-size:15px; padding:14px 12px; white-space:normal; }
   button.attendBtn.on { background:var(--amber); color:#2a1a05; border-color:var(--amber); }
-  /* Away is not an alert state: nothing is wrong, nothing is being watched.
-     Slate rather than amber, so it cannot be mistaken for one. */
-  .attend.away { background:#54646d; color:#f2f7f9; }
-  button.awayOn { background:#54646d; color:#f2f7f9; border-color:#54646d; }
 
   section { margin-top:16px; padding-top:14px; border-top:1px solid var(--rule); }
   section > .lbl { display:block; margin-bottom:8px; }
@@ -190,8 +186,6 @@
     <div class="hud" id="hud">
       <div class="attend hidden" id="attendBanner">Operator at machine · camera ignored ·
         <b id="attendLeft">5:00</b></div>
-      <div class="attend away hidden" id="awayBanner">Operator away · not monitoring,
-        nothing being recorded</div>
       <div class="hudMain">
         <div>
           <div class="lbl">core exposed</div>
@@ -265,11 +259,6 @@
       </div>
       <p class="note" id="attendNote">Press when the machine door opens — a fault, a swap,
         anything. The camera is ignored until you press again, press Reset, or 5 minutes pass.</p>
-      <div class="row">
-        <button id="awayBtn" class="attendBtn" disabled>Operator away</button>
-      </div>
-      <p class="note" id="awayNote">Press when you leave. Monitoring and the clock both stop,
-        and stay stopped until you press it again — no time limit.</p>
       <div class="row">
         <button id="faultBtn">Stop detection</button>
       </div>
@@ -364,7 +353,7 @@ const gctx = grab.getContext("2d", { willReadFrequently: true });
    reload can show the old shell while the new one installs behind it. A build
    string settles that in a glance instead of by hunting for a changed word. */
 const VERSION = "1.0.0";
-const BUILD = "1abfc08";        // rewritten on publish; "dev" means a local checkout
+const BUILD = "a24e6a7";        // rewritten on publish; "dev" means a local checkout
 
 const SAMPLE_S = 0.5;        // seconds between samples, in SOURCE time
 const MEDIAN_WINDOW = 5;     // smooth before the clamp, so one spike cannot ratchet
@@ -553,7 +542,6 @@ let prevMotion = null, hotCount = null, warmSamples = 0, warmFrames = [];
 let motionMask = null, maskBuf = null, prevMaskBuf = null;
 let motionOutside = null, outBuf = null, prevOutBuf = null;   // the frame around the mask
 let attendedSince = null, attendTimer = null, attendTicker = null, alertHoldUntil = 0;
-let awaySince = null;
 
 /* ---- setup restore ---------------------------------------------------- */
 $("topic").value = store.get("topic", null) ?? DEFAULT_TOPIC;
@@ -829,7 +817,6 @@ function updateStart() {
   $("start").textContent = log ? "End" : "Start";
   $("start").className = log ? "stop" : "go";
   paintIntervention();
-  paintAway();
   checkAspect();
 }
 
@@ -928,7 +915,7 @@ $("start").onclick = () => log ? endShift() : startRun();
    recalibrating from a saved video stops the run to do it, and with the button
    meaning End while a shift is open, nothing else would start it again. */
 function resumeShift() {
-  if (log && !running && cal && source && awaySince === null) startRun({ resume: true });
+  if (log && !running && cal && source) startRun({ resume: true });
 }
 /* Reset is the bobbin-swap button: same session, same camera, next bobbin. So
    it re-derives the baseline exactly as Start does. Hooking the reseed to
@@ -1814,8 +1801,7 @@ function paintTally() {
   set("tScrap", shift.scrapBobbins);
   set("tDone", shift.bobbinsCompleted);
   set("tIdle", mmss(shift.idleDuringBobbinBuildSeconds));
-  // stopped during a build, plus stopped between bobbins; time away is in
-  // neither, which is what makes it the figure to read from the machine
+  // stopped during a build, plus stopped between one bobbin and the next
   $("tTotalIdle").textContent = mmss(shift.totalIdleSeconds);
   $("tShift").disabled = true;          // named at the start, fixed for the shift
 }
@@ -1890,7 +1876,7 @@ function endIntervention(by) {
 
 function paintIntervention() {
   const on = attendedSince !== null, b = $("attendBtn");
-  b.disabled = !log || awaySince !== null;
+  b.disabled = !log;
   b.classList.toggle("on", on);
   b.textContent = on ? "Operator intervention: ON" : "Operator intervention";
   $("attendBanner").classList.toggle("hidden", !on);
@@ -1900,75 +1886,11 @@ function paintIntervention() {
 $("attendBtn").onclick = () =>
   attendedSince === null ? startIntervention() : endIntervention("button");
 
-/* ---- operator away -------------------------------------------------------
-   Different from an intervention, and the difference is the whole point.
-   An intervention says someone is at the machine and the camera cannot be
-   believed; the shift clock keeps running, because the machine is standing
-   still on company time and that is worth knowing. Away says nobody is here
-   at all: the app stops watching and stops counting, and the time is left out
-   of every figure rather than counted as idle. A tea break is not a stoppage
-   the machine is answerable for.
-
-   No timeout, by the operator's decision on 15 Oct. A timeout exists to stop
-   the camera being blinded indefinitely, which is a real risk while someone
-   is working in front of it; here nothing is being recorded either way, and
-   an app that quietly started counting again while the floor was empty would
-   put the break into the idle total -- the exact thing this prevents. It ends
-   when someone comes back and says so. */
-function startAway() {
-  if (!log || awaySince !== null) return;
-  /* The machine cannot be left running, so record the stop at the press --
-     the same reasoning as an intervention, and it keeps the away window
-     inside a stopped stretch where it is simply cut out. */
-  if (machineMoving) {
-    machineMoving = false;
-    log.add(Shift.EV.MOTION_STOPPED, { pct: +clamped.toFixed(1), outside: null, by: "away" });
-  }
-  endIntervention("away");            // nobody can be at a machine they left
-  if (alertKind) acknowledge();
-  awaySince = Date.now();
-  log.add(Shift.EV.AWAY_STARTED);
-  stopRun();                          // the camera is not read again until they return
-  $("awayNote").className = "note warn";
-  $("awayNote").textContent = "Nobody at the machine — monitoring and the clock are stopped. " +
-    "Press again when you are back.";
-  paintAway();
-}
-
-function endAway(by) {
-  if (awaySince === null) return;
-  const lasted = Math.round((Date.now() - awaySince) / 1000);
-  log?.add(Shift.EV.AWAY_ENDED, { by });
-  awaySince = null;
-  $("awayNote").className = "note";
-  $("awayNote").textContent = `Away for ${mmss(lasted)} — not counted as idle.`;
-  paintAway();
-  // back to watching, with the baseline this bobbin already has
-  if (by !== "end") resumeShift();
-}
-
-function paintAway() {
-  const on = awaySince !== null, b = $("awayBtn");
-  b.disabled = !log;
-  b.classList.toggle("awayOn", on);
-  b.textContent = on ? "Operator away: ON — press when back" : "Operator away";
-  $("awayBanner").classList.toggle("hidden", !on);
-  /* Nothing is recorded while away, so nothing that records anything is
-     offered. End is the exception: a shift must always be closeable. These
-     are set both ways here -- a control disabled by one state and re-enabled
-     by another is how a button ends up dead for the rest of a shift. */
-  $("reset").disabled = on;
-  $("bobbinDone").disabled = on || !log;
-  paintIntervention();
-}
-$("awayBtn").onclick = () => awaySince === null ? startAway() : endAway("button");
-
 /* End closes the shift and files it. Only this button does -- switching source
    or losing the camera stops the run without ending anything. */
 function endShift() {
   if (log) {
     endIntervention("end");
-    endAway("end");
     log.add(Shift.EV.SHIFT_ENDED, { peakPct: +clamped.toFixed(1) });
     const { shift } = log.derive({ now: Date.now() });
     /* Keep the events, not just the summary. The rules that turn one into the
@@ -2022,7 +1944,6 @@ function download(name, text, type) {
 
 paintTally();
 paintIntervention();
-paintAway();
 
 $("verChip").textContent = `v${VERSION}` + (BUILD === "dev" ? " dev" : ` · ${BUILD}`);
 
