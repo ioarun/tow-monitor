@@ -198,8 +198,8 @@
                          autocomplete="off" maxlength="12">shift</span>
             <span><input id="tScrap" class="num" inputmode="numeric">scrap bobbins used</span>
             <span><input id="tDone" class="num" inputmode="numeric">completed</span>
-            <span><input id="tIdle" class="num wide" inputmode="numeric">idle</span>
-            <span><b id="tTotalIdle">0:00</b>total idle</span>
+            <span><b id="tBobbinIdle">0:00</b>idle · this bobbin</span>
+            <span><input id="tIdle" class="num wide" inputmode="numeric">idle · shift</span>
           </div>
         </div>
       </div>
@@ -353,7 +353,7 @@ const gctx = grab.getContext("2d", { willReadFrequently: true });
    reload can show the old shell while the new one installs behind it. A build
    string settles that in a glance instead of by hunting for a changed word. */
 const VERSION = "1.0.0";
-const BUILD = "a24e6a7";        // rewritten on publish; "dev" means a local checkout
+const BUILD = "499f524";        // rewritten on publish; "dev" means a local checkout
 
 const SAMPLE_S = 0.5;        // seconds between samples, in SOURCE time
 const MEDIAN_WINDOW = 5;     // smooth before the clamp, so one spike cannot ratchet
@@ -1773,7 +1773,8 @@ function setCarryFromFields() {
   const own = d ? {
     bobbinsCompleted: d.bobbinsCompleted - cur.bobbinsCompleted,
     scrapBobbins: d.scrapBobbins - cur.scrapBobbins,
-    idleSeconds: d.idleDuringBobbinBuildSeconds - cur.idleSeconds,
+    // the field shows the shift total, so that is what the carry must make true
+    idleSeconds: d.totalIdleSeconds - cur.idleSeconds,
   } : { bobbinsCompleted: 0, scrapBobbins: 0, idleSeconds: 0 };
   const carry = {
     bobbinsCompleted: Math.max(0, shown.bobbinsCompleted - own.bobbinsCompleted),
@@ -1782,6 +1783,12 @@ function setCarryFromFields() {
   };
   if (log) log.add(Shift.EV.CARRIED_OVER, carry);
   else { pendingCarry = carry; store.set("carry", carry); }
+  /* Repaint, so the figures agree with what was just typed. Before Start
+     nothing else repaints them -- the ticker only runs once a shift is open --
+     so the bobbin figure sat at zero beside a shift total the operator had
+     just entered. paintTally leaves the focused field alone, so this cannot
+     overwrite someone mid-edit. */
+  paintTally();
 }
 ["tScrap", "tDone", "tIdle"].forEach(id => { $(id).onchange = setCarryFromFields; });
 
@@ -1793,16 +1800,22 @@ function paintTally() {
     set("tScrap", c.scrapBobbins || 0);
     set("tDone", c.bobbinsCompleted || 0);
     set("tIdle", mmss(c.idleSeconds || 0));
-    $("tTotalIdle").textContent = mmss(c.idleSeconds || 0);
+    // before a shift opens, whatever was carried in is all there is, and it
+    // belongs to the bobbin already on the machine
+    $("tBobbinIdle").textContent = mmss(c.idleSeconds || 0);
     $("tShift").disabled = false;
     return;
   }
   const { shift } = log.derive({ now: Date.now() });
   set("tScrap", shift.scrapBobbins);
   set("tDone", shift.bobbinsCompleted);
-  set("tIdle", mmss(shift.idleDuringBobbinBuildSeconds));
-  // stopped during a build, plus stopped between one bobbin and the next
-  $("tTotalIdle").textContent = mmss(shift.totalIdleSeconds);
+  /* Two figures, because one that only ever climbs cannot answer the question
+     the operator is actually asking. The shift total is the day; the bobbin
+     figure starts again at every completion, so an hour lost at four o'clock
+     stops sitting in the number at ten. They compose: every completed
+     bobbin's idle plus this one is the shift total. */
+  $("tBobbinIdle").textContent = mmss(shift.currentBobbinIdleSeconds);
+  set("tIdle", mmss(shift.totalIdleSeconds));
   $("tShift").disabled = true;          // named at the start, fixed for the shift
 }
 setInterval(() => { if (log) paintTally(); }, 2000);
@@ -1824,8 +1837,9 @@ $("bobbinDone").onclick = () => {
   $("sessionNote").className = "note ok";
   $("sessionNote").textContent =
     `Bobbin ${b.seq} completed — ${b.scrapBobbins} scrap bobbin${b.scrapBobbins === 1 ? "" : "s"}, ` +
-    `${mmss(b.runSeconds)} running, ${mmss(b.idleDuringBobbinBuildSeconds)} idle` +
-    (b.utilisation !== null ? ` (${b.utilisation}% used).` : ".");
+    `${mmss(b.runSeconds)} running, ${mmss(b.totalIdleSeconds)} idle on it` +
+    (b.utilisation !== null ? ` (${b.utilisation}% used)` : "") +
+    `. Idle · this bobbin starts again from zero.`;
 };
 
 /* ---- operator intervention ----------------------------------------------

@@ -292,6 +292,9 @@ function derive(events, { now = null, missAbovePct = MISS_ABOVE_PCT } = {}) {
       runSeconds: secs(run),
       idleDuringBobbinBuildSeconds: secs(idleMs),
       idleAfterBobbinCompleteSeconds: secs(afterIn(from, to)),
+      // the two kinds added up: everything this bobbin stood still for,
+      // whichever side of the previous completion it fell
+      totalIdleSeconds: secs(idleMs + afterIn(from, to)),
       attendedSeconds: secs(attendedIn(from, to)),
       // a scrap bobbin counts against whichever bobbin it was used up feeding
       scrapBobbins: runs.filter(r => !r.open && r.endedAt > from && r.endedAt <= to).length,
@@ -319,9 +322,25 @@ function derive(events, { now = null, missAbovePct = MISS_ABOVE_PCT } = {}) {
     bobbins[0].scrapBobbins += carried.scrapBobbins;
     bobbins[0].idleDuringBobbinBuildSeconds =
       Math.round((bobbins[0].idleDuringBobbinBuildSeconds + carried.idleSeconds) * 10) / 10;
+    // and into its total, which is the figure the operator compares against
+    bobbins[0].totalIdleSeconds =
+      Math.round((bobbins[0].totalIdleSeconds + carried.idleSeconds) * 10) / 10;
     const r = bobbins[0].runSeconds, i = bobbins[0].idleDuringBobbinBuildSeconds;
     bobbins[0].utilisation = r + i > 0 ? Math.round((1000 * r) / (r + i)) / 10 : null;
   }
+
+  /* The bobbin on the rewinder right now: idle since the last one came off.
+     Without this the only idle figure on screen is the shift total, which can
+     only ever climb -- so an hour lost at 16:00 is still sitting in the number
+     at 22:00, and the operator cannot see whether the bobbin they are making
+     is going well. This one starts again at every completion.
+
+     Carry belongs to it only while it IS the first bobbin; once one has been
+     completed the carry has been spent on that, and bobbins[0] holds it. */
+  const sinceCompletion = completions.length ? completions[completions.length - 1].t : startedAt;
+  const currentBobbinIdleSeconds = Math.round(10 *
+    (secs(idleIn(sinceCompletion, horizon) + afterIn(sinceCompletion, horizon)) +
+     (completions.length ? 0 : carried.idleSeconds))) / 10;
 
   const closed = runs.filter(r => !r.open);
   const warnings = runs.map(r => r.warningSeconds).filter(x => x !== null);
@@ -349,6 +368,11 @@ function derive(events, { now = null, missAbovePct = MISS_ABOVE_PCT } = {}) {
       /* Every second the machine stood still: stopped during a build, plus
          stopped between one bobbin and the next. The figure on screen. */
       totalIdleSeconds: r1(idleSec + secs(afterIn(startedAt, horizon))),
+      /* The two figures the operator reads: this bobbin, and the shift. They
+         compose -- every completed bobbin's totalIdleSeconds plus this one
+         adds up to totalIdleSeconds above. */
+      currentBobbinIdleSeconds,
+      lastBobbinIdleSeconds: bobbins.length ? bobbins[bobbins.length - 1].totalIdleSeconds : null,
       attendedSeconds: secs(attendedIn(startedAt, horizon)),
       interventions: attended.length,
       interventionsTimedOut: attended.filter(w => w.by === "timeout").length,
@@ -380,11 +404,12 @@ function toCSV(runs, shift) {
 function bobbinsCSV(bobbins, shift) {
   const cols = ["shift", "shiftName", "completedBobbin", "elapsedSeconds", "runSeconds",
                 "idleDuringBobbinBuildSeconds", "idleAfterBobbinCompleteSeconds",
-                "attendedSeconds", "scrapBobbins", "utilisationPct"];
+                "totalIdleSeconds", "attendedSeconds", "scrapBobbins", "utilisationPct"];
   const rows = bobbins.map(b => [
     shift ? shift.shiftNo : "", shift ? (shift.name ?? "") : "", b.seq,
     b.elapsedSeconds, b.runSeconds, b.idleDuringBobbinBuildSeconds,
-    b.idleAfterBobbinCompleteSeconds, b.attendedSeconds, b.scrapBobbins, b.utilisation ?? ""]);
+    b.idleAfterBobbinCompleteSeconds, b.totalIdleSeconds, b.attendedSeconds,
+    b.scrapBobbins, b.utilisation ?? ""]);
   return [cols.join(","), ...rows.map(r => r.join(","))].join("\n");
 }
 
