@@ -329,18 +329,40 @@ function derive(events, { now = null, missAbovePct = MISS_ABOVE_PCT } = {}) {
     bobbins[0].utilisation = r + i > 0 ? Math.round((1000 * r) / (r + i)) / 10 : null;
   }
 
-  /* The bobbin on the rewinder right now: idle since the last one came off.
-     Without this the only idle figure on screen is the shift total, which can
-     only ever climb -- so an hour lost at 16:00 is still sitting in the number
-     at 22:00, and the operator cannot see whether the bobbin they are making
-     is going well. This one starts again at every completion.
+  /* Idle on the bobbin being built, rather than on the whole shift. Without
+     it the only figure on screen is the shift total, which can only ever climb
+     -- so an hour lost at 16:00 is still sitting in the number at 22:00, and
+     the operator cannot see whether the bobbin in front of them is going well.
 
-     Carry belongs to it only while it IS the first bobbin; once one has been
-     completed the carry has been spent on that, and bobbins[0] holds it. */
-  const sinceCompletion = completions.length ? completions[completions.length - 1].t : startedAt;
-  const currentBobbinIdleSeconds = Math.round(10 *
-    (secs(idleIn(sinceCompletion, horizon) + afterIn(sinceCompletion, horizon)) +
-     (completions.length ? 0 : carried.idleSeconds))) / 10;
+     It has three states, because between one bobbin and the next there is no
+     bobbin being built:
+
+       before any completion   counting from the start of the shift, carry
+                               included -- the carry was spent on this bobbin
+       completed, no Reset yet FROZEN at what that bobbin cost. The operator
+                               is changing it over and this is the last
+                               complete answer there is; a counter that reset
+                               itself the moment they pressed the button would
+                               blank the number they pressed it to read
+       Reset pressed           counting again from that press, at zero
+
+     The FIRST Reset after the completion is what starts the next bobbin.
+     Later Resets are scrap-bobbin swaps, several per bobbin, and must not
+     restart the count.
+
+     The changeover itself -- completion to that first Reset -- is on neither
+     bobbin: it is idleAfterBobbinCompleteSeconds, which is counted and
+     exported separately, and it is in the shift total either way. */
+  const lastCompletion = completions.length ? completions[completions.length - 1] : null;
+  const startsNext = lastCompletion
+    ? ev.find(e => e.type === EV.RUN_RESET && e.t >= lastCompletion.t) : null;
+  const currentBobbinFrozen = !!lastCompletion && !startsNext;
+  const idleSince = from => Math.round(10 * secs(idleIn(from, horizon) + afterIn(from, horizon))) / 10;
+  const currentBobbinIdleSeconds =
+      !lastCompletion ? Math.round(10 * (secs(idleIn(startedAt, horizon) + afterIn(startedAt, horizon))
+                                         + carried.idleSeconds)) / 10
+    : currentBobbinFrozen ? bobbins[bobbins.length - 1].totalIdleSeconds
+    : idleSince(startsNext.t);
 
   const closed = runs.filter(r => !r.open);
   const warnings = runs.map(r => r.warningSeconds).filter(x => x !== null);
@@ -372,6 +394,9 @@ function derive(events, { now = null, missAbovePct = MISS_ABOVE_PCT } = {}) {
          compose -- every completed bobbin's totalIdleSeconds plus this one
          adds up to totalIdleSeconds above. */
       currentBobbinIdleSeconds,
+      // true while it is showing the bobbin that just came off, not one being
+      // built -- the screen says "last bobbin" rather than "this bobbin"
+      currentBobbinFrozen,
       lastBobbinIdleSeconds: bobbins.length ? bobbins[bobbins.length - 1].totalIdleSeconds : null,
       attendedSeconds: secs(attendedIn(startedAt, horizon)),
       interventions: attended.length,

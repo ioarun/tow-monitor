@@ -126,6 +126,11 @@
                 text-transform:uppercase; display:flex; flex-direction:column-reverse;
                 align-items:flex-start; gap:.15em; }
   .tally b { font-size:clamp(20px,3.6vmin,32px); color:var(--ink); letter-spacing:-.01em; }
+  .tally em { font-style:normal; }
+  /* Frozen on the bobbin that just came off: amber, so a figure that is not
+     moving cannot be mistaken for one that is. */
+  .tally span.held em { color:var(--amber); }
+  .tally span.held b { color:var(--amber); }
   /* The shift is a name the operator types, not a number we allocate -- the
      words that mean something here are theirs ("Arvo", "Night"), and an index
      would make them translate every time they looked at it. */
@@ -198,7 +203,7 @@
                          autocomplete="off" maxlength="12">shift</span>
             <span><input id="tScrap" class="num" inputmode="numeric">scrap bobbins used</span>
             <span><input id="tDone" class="num" inputmode="numeric">completed</span>
-            <span><b id="tBobbinIdle">0:00</b>idle · this bobbin</span>
+            <span><b id="tBobbinIdle">0:00</b><em id="tBobbinLbl">idle · this bobbin</em></span>
             <span><input id="tIdle" class="num wide" inputmode="numeric">idle · shift</span>
           </div>
         </div>
@@ -353,7 +358,7 @@ const gctx = grab.getContext("2d", { willReadFrequently: true });
    reload can show the old shell while the new one installs behind it. A build
    string settles that in a glance instead of by hunting for a changed word. */
 const VERSION = "1.0.0";
-const BUILD = "499f524";        // rewritten on publish; "dev" means a local checkout
+const BUILD = "32d13b5";        // rewritten on publish; "dev" means a local checkout
 
 const SAMPLE_S = 0.5;        // seconds between samples, in SOURCE time
 const MEDIAN_WINDOW = 5;     // smooth before the clamp, so one spike cannot ratchet
@@ -935,6 +940,7 @@ $("reset").onclick = () => {
   resetRun();
   $("runNote").className = "note";
   $("runNote").textContent = "reset";
+  paintTally();           // this press starts the next bobbin; show it at once
   if (cal && source) reseedBaseline();
 };
 
@@ -1815,6 +1821,11 @@ function paintTally() {
      stops sitting in the number at ten. They compose: every completed
      bobbin's idle plus this one is the shift total. */
   $("tBobbinIdle").textContent = mmss(shift.currentBobbinIdleSeconds);
+  /* Between Bobbin complete and the next Reset no bobbin is being built, so
+     the figure holds at what the last one cost -- the number the operator
+     pressed the button to read -- and says so. Reset starts the next one. */
+  $("tBobbinLbl").textContent = shift.currentBobbinFrozen ? "idle · last bobbin" : "idle · this bobbin";
+  $("tBobbinIdle").parentElement.classList.toggle("held", shift.currentBobbinFrozen);
   set("tIdle", mmss(shift.totalIdleSeconds));
   $("tShift").disabled = true;          // named at the start, fixed for the shift
 }
@@ -1839,7 +1850,7 @@ $("bobbinDone").onclick = () => {
     `Bobbin ${b.seq} completed — ${b.scrapBobbins} scrap bobbin${b.scrapBobbins === 1 ? "" : "s"}, ` +
     `${mmss(b.runSeconds)} running, ${mmss(b.totalIdleSeconds)} idle on it` +
     (b.utilisation !== null ? ` (${b.utilisation}% used)` : "") +
-    `. Idle · this bobbin starts again from zero.`;
+    `. The idle figure holds on this bobbin until you press Reset for the next one.`;
 };
 
 /* ---- operator intervention ----------------------------------------------
