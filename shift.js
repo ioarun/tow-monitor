@@ -207,6 +207,13 @@ function derive(events, { now = null, missAbovePct = MISS_ABOVE_PCT } = {}) {
     const ack = mine.find(e => e.type === EV.DEPLETION_ACKNOWLEDGED);
     const lastStop = spans.length ? spans[spans.length - 1].end : null;
     const stoppedAtEnd = spans.length > 0 && (!!closer || lastStop < to);
+    /* The run the machine was in when the alert fired, if it was running at
+       all. A1 reads exposure and does not care about motion, so it can fire
+       at a machine that is already stopped -- on 15 Oct three of sixteen did,
+       one of them during a stop that lasted an hour and three quarters. There
+       is no warning time to measure there: the operator had already acted, and
+       timing to the end of some later run reported 6116 s of "warning". */
+    const spanAtAlert = alert ? spans.find(sp => sp.start <= alert.t && sp.end >= alert.t) : null;
     const peakPct = closer && typeof closer.peakPct === "number" ? closer.peakPct
                   : alert ? alert.pct : null;
 
@@ -248,9 +255,26 @@ function derive(events, { now = null, missAbovePct = MISS_ABOVE_PCT } = {}) {
       peakPct,
       alertedAt: alert ? alert.t : null,
       alertPct: alert ? alert.pct : null,
-      // to the LAST stop: an early stop at 40% is not the tow running out, and
-      // measuring to it would flatter the system
-      warningSeconds: alert && stoppedAtEnd ? secs(lastStop - alert.t) : null,
+      /* To the FIRST stop after the alert: the question this answers is how
+         long the operator had between being told and having to act, and they
+         acted at the first stop.
+
+         It used to measure to the LAST stop before Reset, on the reasoning
+         that a stop at 40% is the operator jumping early and the real one
+         comes later. Thursday's shift showed what that does to the number.
+         After stopping at depletion the operator jogs the machine to work the
+         last tow through -- three- and six-second bursts at 98-99% exposed --
+         and the rule latched onto the last of those: a median of 648 s where
+         the operator had, in fact, a median of 22 s. A metric the PRD's whole
+         case rests on cannot be off by a factor of thirty.
+
+         Jumping early is still visible, and better: warningStopPct is the
+         exposure at that stop. 92% means the tow genuinely ran out; 49% means
+         they stopped early and the alert bought more than the seconds say. The
+         exposure tells you which without distorting the time, and every stop
+         in the run is in `stops` with its own reading either way. */
+      warningSeconds: spanAtAlert ? secs(spanAtAlert.end - alert.t) : null,
+      warningStopPct: spanAtAlert ? spanAtAlert.stopPct : null,
       ackSeconds: alert && ack ? secs(ack.t - alert.t) : null,
       endedBy: alert ? "depleted"
              : (peakPct !== null && peakPct >= missAbovePct) ? "missed" : "abandoned",
@@ -413,7 +437,8 @@ function derive(events, { now = null, missAbovePct = MISS_ABOVE_PCT } = {}) {
 /* Rows a spreadsheet can open. Data that cannot leave the tablet is not data. */
 function toCSV(runs, shift) {
   const cols = ["shift", "shiftName", "bobbin", "runSeconds", "swapSeconds", "peakPct",
-                "warningSeconds", "ackSeconds", "endedBy", "faultStops", "faultStopSeconds",
+                "warningSeconds", "warningStopPct", "ackSeconds", "endedBy",
+                "faultStops", "faultStopSeconds",
                 "depletionPauses", "depletionPauseSeconds", "stopsAt"];
   // "fault 12.0 / pause 40.1 / swap 99.2" -- no commas, so it survives as one cell
   const stopsAt = r => (r.stops || []).filter(x => x.kind !== "current")
@@ -421,7 +446,7 @@ function toCSV(runs, shift) {
   const rows = runs.map(r => [
     shift ? shift.shiftNo : "", shift ? (shift.name ?? "") : "",
     r.seq, r.runSeconds, r.swapSeconds ?? "",
-    r.peakPct ?? "", r.warningSeconds ?? "", r.ackSeconds ?? "", r.endedBy,
+    r.peakPct ?? "", r.warningSeconds ?? "", r.warningStopPct ?? "", r.ackSeconds ?? "", r.endedBy,
     r.faultStops, r.faultStopSeconds, r.depletionPauses, r.depletionPauseSeconds, stopsAt(r)]);
   return [cols.join(","), ...rows.map(r => r.join(","))].join("\n");
 }
