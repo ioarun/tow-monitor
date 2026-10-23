@@ -358,7 +358,7 @@ const gctx = grab.getContext("2d", { willReadFrequently: true });
    reload can show the old shell while the new one installs behind it. A build
    string settles that in a glance instead of by hunting for a changed word. */
 const VERSION = "1.0.0";
-const BUILD = "766c1a4";        // rewritten on publish; "dev" means a local checkout
+const BUILD = "a2cce5b";        // rewritten on publish; "dev" means a local checkout
 
 const SAMPLE_S = 0.5;        // seconds between samples, in SOURCE time
 const MEDIAN_WINDOW = 5;     // smooth before the clamp, so one spike cannot ratchet
@@ -1334,17 +1334,8 @@ function checkStopped(img, grid) {
   } else if (!machineMoving && movingFor >= RESUME_HOLD) {
     machineMoving = true;
     alertHoldUntil = 0;     // the hold covered the stop the operator dealt with, not the next
-    /* Backdated, but never past the stop it follows. The derivation reads the
-       log in time order, so a restart timestamped even a millisecond before
-       the preceding stop is read as happening first -- and is then dropped,
-       because an interval is already open. On 15 Oct that happened once, by
-       14 ms, and cost the record a restart: the machine read as stopped for
-       an hour and three quarters when it had in fact run for a minute and a
-       half in the middle of it. One inversion, one wrong afternoon. */
-    const back = Date.now() - RESUME_HOLD * 1000;
-    const prev = log?.events[log.events.length - 1];
     log?.add(Shift.EV.MOTION_STARTED, { level: +m.toFixed(1), outside: around },
-             prev ? Math.max(back, prev.t + 1) : back);
+             Date.now() - RESUME_HOLD * 1000);
   }
   /* "around" is the surround's figure. When the mask is moving but the
      surround is moving too, say that it is being discounted -- otherwise a
