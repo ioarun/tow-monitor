@@ -389,8 +389,8 @@ const gctx = grab.getContext("2d", { willReadFrequently: true });
    time at the machine more than once: the service worker is cache-first, so a
    reload can show the old shell while the new one installs behind it. A build
    string settles that in a glance instead of by hunting for a changed word. */
-const VERSION = "1.2.0";
-const BUILD = "8a3c7bc";        // rewritten on publish; "dev" means a local checkout
+const VERSION = "1.2.1";
+const BUILD = "4f97622";        // rewritten on publish; "dev" means a local checkout
 
 const SAMPLE_S = 0.5;        // seconds between samples, in SOURCE time
 const MEDIAN_WINDOW = 5;     // smooth before the clamp, so one spike cannot ratchet
@@ -2605,6 +2605,9 @@ function endShift() {
       try { wrote = writeFiles([record], `${Shift.fileSlug(shift.name)}-${fileStamp()}`); }
       catch { writeFailed = true; }
     }
+    /* Before the log goes. A recording still open at the end of a shift keeps
+       that shift's events, whether it is stopped now or in a minute. */
+    if (trace) trace.events = log.events;
     log = null; machineMoving = false;
     pendingCarry = null; store.set("carry", null);
     $("bobbinDone").disabled = true;
@@ -2620,6 +2623,10 @@ function endShift() {
   stopRun();
   updateStart();
   paintTally();
+  /* And finish the recording, rather than leaving it running over a shift that
+     is over. Left open it would be lost on the next reload without ever being
+     written -- a silent loss, which is the kind this app keeps finding. */
+  if (trace) stopRecording();
 }
 
 /* --- the recorder ---------------------------------------------------------
@@ -2707,7 +2714,7 @@ function startRecording() {
        without this the trace gives no way to tell that was why. */
     cameraLock: camLock,
     frame: { w: vid.videoWidth || null, h: vid.videoHeight || null },
-    rows: [], arms: [], shots: [], truncated: false,
+    rows: [], arms: [], shots: [], events: [], truncated: false,
   };
   traceCur = null;
   traceShot("recording started");
@@ -2725,8 +2732,14 @@ function stopRecording() {
   /* The shift's own events go in, so the trace is self-contained and the
      operator's presses label it: Reset, Bobbin complete, the alerts, the joins.
      The ntfy topic is deliberately NOT here -- a trace is a file that gets sent
-     around, and the topic is the one secret this app has. */
-  t.events = log ? log.events : [];
+     around, and the topic is the one secret this app has.
+
+     Whatever endShift already stashed wins. End nulls `log`, so reading it here
+     after a shift has ended gave an empty array -- and the file still wrote,
+     looking fine, with every operator label gone. A trace without the joins is
+     a trace with no labelled still-machine data in it, which is most of why it
+     is worth recording. */
+  if (!t.events?.length) t.events = log ? log.events : [];
   trace = null; traceCur = null;
   paintRec();
 
