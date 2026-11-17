@@ -9,11 +9,24 @@
  * files without changing it ships nothing to the device. The publish
  * workflow rewrites this line with the source commit, so it cannot be
  * forgotten; the value here is only what a local checkout uses. */
-const CACHE = "tow-monitor-a473ded";
-const SHELL = ["./", "./index.html", "./cv.js", "./shift.js", "./manifest.webmanifest"];
+const CACHE = "tow-monitor-8a3c7bc";
+/* The icons are in the shell too: an installed app whose icon 404s on a
+   workshop with no connectivity is an app with no icon. */
+const SHELL = ["./", "./index.html", "./cv.js", "./shift.js", "./manifest.webmanifest",
+               "./icon-192.png", "./icon-512.png", "./icon-maskable-512.png",
+               "./favicon-32.png"];
+
+/* Nice to have, but not worth failing the install over. cache.addAll is
+   atomic: one 404 and NOTHING is cached, so the app loses offline start
+   entirely. baseline.json is written by tools/baseline.js and may legitimately
+   not exist yet, so it is fetched separately and its failure ignored. */
+const EXTRAS = ["./baseline.json"];
 
 self.addEventListener("install", e => {
-  e.waitUntil(caches.open(CACHE).then(c => c.addAll(SHELL)).then(() => self.skipWaiting()));
+  e.waitUntil(caches.open(CACHE)
+    .then(c => c.addAll(SHELL).then(() => Promise.all(
+      EXTRAS.map(u => c.add(u).catch(() => {})))))
+    .then(() => self.skipWaiting()));
 });
 
 self.addEventListener("activate", e => {

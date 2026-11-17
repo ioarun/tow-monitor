@@ -7,6 +7,8 @@
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="theme-color" content="#0d1316">
 <link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" type="image/png" sizes="32x32" href="favicon-32.png">
+<link rel="apple-touch-icon" href="icon-192.png">
 <title>Tow Monitor</title>
 <style>
   :root {
@@ -234,21 +236,31 @@
 
     <section>
       <span class="lbl">2 · Calibrate</span>
-      <p class="note" id="calHint">Two stills, nothing in between. Capture a full bobbin,
-        then the bare tube — either at the end of a run, or by swapping an empty tube into
-        the same place.</p>
       <div class="row">
-        <button id="capFull" disabled>1 · Full bobbin</button>
-        <button id="capBare" disabled>2 · Bare tube</button>
+        <button id="calToggle" class="seg">Recalibrate</button>
       </div>
-      <div class="row">
-        <canvas id="thumbFull" class="thumb"></canvas>
-        <canvas id="thumbBare" class="thumb"></canvas>
+      <div id="calBody">
+        <p class="note" id="calHint">Once per camera position, not per run. Two stills:
+          a full bobbin, then the bare tube. After the first run the app offers to re-fit
+          from the bobbin that just ran down, so no empty tube is needed.</p>
+        <div class="row">
+          <button id="capFull" disabled>1 · Full bobbin</button>
+          <button id="capBare" disabled>2 · Bare tube</button>
+        </div>
+        <div class="row">
+          <canvas id="thumbFull" class="thumb"></canvas>
+          <canvas id="thumbBare" class="thumb"></canvas>
+        </div>
       </div>
       <p class="note" id="calNote"></p>
-      <div class="row">
+      <p class="note" id="autoCalNote"></p>
+      <div class="row hidden" id="autoCalRow">
+        <button id="autoCalBtn" class="go seg">Use the last bobbin</button>
+        <button id="autoCalNo" class="seg">Keep the current one</button>
+      </div>
+      <div class="row" id="calFileRow">
         <input type="file" id="calFile" accept="video/*" class="hidden">
-        <button onclick="calFile.click()">Calibrate from a saved video instead</button>
+        <button onclick="calFile.click()" class="seg">Calibrate from a saved video instead</button>
       </div>
     </section>
 
@@ -260,10 +272,14 @@
       </div>
       <p class="note" id="runNote"></p>
       <div class="row">
+        <button id="camLockBtn">Lock camera</button>
+      </div>
+      <p class="note" id="camLockNote"></p>
+      <div class="row">
         <button id="attendBtn" class="attendBtn" disabled>Operator intervention</button>
       </div>
-      <p class="note" id="attendNote">Press when the machine door opens — a fault, a swap,
-        anything. The camera is ignored until you press again, press Reset, or 5 minutes pass.</p>
+      <p class="note" id="attendNote">Press when the door opens. The camera is ignored
+        until you press it again, press Reset, or 5 minutes pass.</p>
       <div class="row">
         <button id="faultBtn">Stop detection</button>
       </div>
@@ -274,7 +290,12 @@
       </div>
       <div class="row">
         <button id="autoExportBtn">Auto export</button>
+        <button id="recBtn">Record run</button>
       </div>
+      <p class="note" id="baseNote"></p>
+      <p class="note" id="recNote">Records what the detector measured, twice a second, plus a
+        few small stills — not video. Stopping downloads the traces to this tablet. They only
+        change anything once they are applied from the workstation and published back.</p>
       <p class="note" id="sessionNote"></p>
     </section>
 
@@ -368,8 +389,8 @@ const gctx = grab.getContext("2d", { willReadFrequently: true });
    time at the machine more than once: the service worker is cache-first, so a
    reload can show the old shell while the new one installs behind it. A build
    string settles that in a glance instead of by hunting for a changed word. */
-const VERSION = "1.1.0";
-const BUILD = "a473ded";        // rewritten on publish; "dev" means a local checkout
+const VERSION = "1.2.0";
+const BUILD = "8a3c7bc";        // rewritten on publish; "dev" means a local checkout
 
 const SAMPLE_S = 0.5;        // seconds between samples, in SOURCE time
 const MEDIAN_WINDOW = 5;     // smooth before the clamp, so one spike cannot ratchet
@@ -520,6 +541,30 @@ const store = {
 };
 
 let cal = store.get("cal", null);
+/* --- calibration harvested from a real run -------------------------------
+ * The fit needs two frames and they have to DIFFER: the region is the pixels
+ * that gained warmth, gainAt is searched by whether the resulting region passes
+ * the baseline and ceiling checks, and creamWarm is Otsu over pixels that are
+ * black tow in one frame and bare tube in the other. A full bobbin alone
+ * contains no tube, so there is nothing in it to locate the tube from or to
+ * learn its colour from. That is why the two-still step cannot simply be
+ * deleted -- it is a limit on what is in the picture, not on the code.
+ *
+ * What CAN go is the staging. At the end of every bobbin the tube is fully
+ * exposed anyway: the second frame exists for free, in the right framing and
+ * the right light, without anyone fetching an empty tube. So the best-exposed
+ * frame of each bobbin is kept, paired with the full-bobbin frame from that
+ * bobbin's reseed, and offered as a fresh calibration when the bobbin is
+ * swapped.
+ *
+ * Offered, not applied. Everything the app reports is relative to the
+ * calibration, so replacing it silently would move every number with no trace
+ * of why -- and a bad auto-fit would be indistinguishable from the machine
+ * changing. The operator sees both sets of figures and taps. */
+const AUTO_BARE_PCT = 90;        // a frame this exposed is a bare-tube candidate
+let autoWound = null;            // the full bobbin, from this bobbin's reseed
+let autoBare = null, autoBarePct = 0;
+let autoOffer = null;            // { wound, bare, fit } waiting for a tap
 /* A calibration saved before the thresholds became per-camera has no
    creamWarm, so measure() falls back to the constant hand-tuned on one device. On a
    sensor whose warmest pixel is 43 that constant is 45, and every reading is
@@ -562,8 +607,42 @@ let sayTimer = null;
 let noiseFloor = null, noiseSamples = [], prevFull = null;
 let log = null, shiftNo = +(store.get("shiftNo", 0)) || 0;
 let pendingOpenShift = null;        // a shift the app was interrupted in the middle of
+let restoredGap = null;             // what the last restore charged to being away
+const GAP_MIN_S = 10;               // under this, a reload is not worth a pair of events
 let machineMoving = false;        // the recorded state, not the alert state
 let prevMotion = null, hotCount = null, warmSamples = 0, warmFrames = [];
+let armAttempts = 0;        // arming retries on this run; 0 once it has armed
+
+/* --- recording a run ------------------------------------------------------
+ * Not video. What the thresholds are set from is the per-sample MEASUREMENTS --
+ * the masked changed fraction, the surround, the whole-frame figure, the noise
+ * floor, and every field of each arming decision. Those are a dozen numbers
+ * twice a second: an hour is a few hundred KB, against a gigabyte of footage
+ * that then has to be got off the tablet and re-decoded to produce the same
+ * numbers. Recording them directly means a run can be replayed through
+ * CV.armingDecision offline and the gates swept, which is the whole point.
+ *
+ * Stills are the exception, and a small one. Numbers cannot answer "is the mask
+ * on the bobbin or on something else", so a handful of heavily downscaled JPEGs
+ * are kept at the moments that matter -- each arming decision, each stop, each
+ * Reset. 320px wide at q0.5 is some 15KB, and there are at most TRACE_MAX_SHOTS.
+ *
+ * The operator's own presses are the labels: the shift log already records
+ * Reset, Bobbin complete, the alerts and the joins, so ground truth comes free
+ * and nothing has to be annotated by hand afterwards. */
+const TRACE_MAX_ROWS = 2 * 60 * 60 * 4;   // 4 hours at SAMPLE_S; then it stops growing
+const TRACE_MAX_SHOTS = 24;
+const SHOT_W = 320;
+let trace = null, traceCur = null;
+/* The run to beat. Fetched from this app's own origin -- it is published
+   alongside index.html -- so comparing a run as it happens needs no credential
+   and no network beyond the one that served the page. tools/baseline.js writes
+   it; nothing on the tablet ever writes back. */
+let baseline = null;
+let liveRun = [], liveStill = [];     // masked readings, running and known-still
+const LIVE_MAX = 4000;
+const shotCv = document.createElement("canvas");
+const shotCtx = shotCv.getContext("2d");
 /* joinUntil: the performance clock reading at which the join window closes, or
    null when no join is running. joinWaiting: the window has closed and the mask
    is being learned on what should now be a turning bobbin -- it is what turns a
@@ -599,12 +678,31 @@ $("thr").oninput = () => {
   $("mThr").textContent = "fires at " + $("thr").value + "%";
 };
 
+/* The calibrate section folds away once there IS a calibration. Its own hint
+   says "once per camera position, not per run", and left open it was eating
+   half the panel during every run -- at 1280x800, the tablet's own size, that
+   pushed Bobbin complete, Export data, Stop detection and Record run all below
+   the fold, where an operator cannot find them. Setup belongs out of the way
+   of the thing the app does all day. */
+let calOpen = false;
+function paintCalSection() {
+  const open = calOpen || !cal;
+  $("calBody").classList.toggle("hidden", !open);
+  $("calFileRow").classList.toggle("hidden", !open);
+  $("calToggle").classList.toggle("hidden", !cal);   // nothing to fold away yet
+  $("calToggle").textContent = open ? "Done — hide calibration" : "Recalibrate";
+  $("calToggle").classList.toggle("on", open);
+}
+$("calToggle").onclick = () => { calOpen = !calOpen; paintCalSection(); };
+
 function paintCalChip() {
   const c = $("calChip");
   if (!cal) { c.textContent = "not calibrated"; c.className = "chip bad"; return; }
   c.textContent = `calibrated ${cal.baselinePct}% → ${cal.ceilingPct}%`;
   c.className = "chip ok";
+  paintCalSection();
 }
+paintCalSection();
 function paintNetChip() {
   const t = $("topic").value.trim();
   $("netChip").textContent = t ? "ntfy " + t.slice(0, 12) : "ntfy off";
@@ -692,6 +790,99 @@ function showStage(on) {
 }
 showStage(false);
 
+/* --- locking the camera --------------------------------------------------
+ * Until now the app asked only for facingMode and a size, and the note under
+ * the camera told the operator to "lock exposure and white balance first if the
+ * camera app allows it" -- which is advice, not a mechanism, and Chrome is not
+ * the camera app.
+ *
+ * It matters twice over. Auto white balance neutralising the warm tube is a
+ * documented failure mode for A1, since the whole depletion measure is R-B
+ * inside the ROI. And for A2 the noise floor is learned in the first
+ * NOISE_WARMUP seconds, which is exactly when auto-exposure is still hunting:
+ * a floor measured through an exposure ramp is measured over the ramp, and
+ * every arming decision afterwards is referenced to it.
+ *
+ * None of this is guaranteed. exposureMode and whiteBalanceMode are an optional
+ * part of the spec, Android support varies by device and by Chrome version, and
+ * this has never run on the tablet. So: ask what the track can do, apply only
+ * what it says it supports, never let a failure touch the run, and report
+ * exactly what happened -- an untested feature that reports nothing is one
+ * nobody can tell is broken.
+ *
+ * The delay is deliberate. Locking the instant the stream opens freezes the
+ * exposure mid-ramp, which is worse than not locking at all; AE needs a moment
+ * to settle on the scene first. */
+const CAM_SETTLE_MS = 1200;
+let camLock = null;            // what the last attempt actually achieved
+
+async function lockCamera({ settle = CAM_SETTLE_MS } = {}) {
+  const track = stream?.getVideoTracks?.()[0];
+  if (!track) return (camLock = { ok: false, why: "no camera track" });
+  if (settle) await new Promise(r => setTimeout(r, settle));
+
+  let caps = {};
+  try { caps = track.getCapabilities ? track.getCapabilities() : {}; }
+  catch { /* Android has been known to throw here rather than return {} */ }
+
+  /* Only what this track says it supports. Asking for a mode that is not in
+     getCapabilities makes applyConstraints reject the WHOLE set, so a
+     white-balance lock this camera cannot do would silently cost the exposure
+     lock it can. */
+  const want = {};
+  if (caps.exposureMode?.includes("manual")) want.exposureMode = "manual";
+  if (caps.whiteBalanceMode?.includes("manual")) want.whiteBalanceMode = "manual";
+  if (caps.focusMode?.includes("manual")) want.focusMode = "manual";
+  const asked = Object.keys(want);
+  if (!asked.length) {
+    return (camLock = { ok: false, asked, got: [], caps: Object.keys(caps),
+      why: Object.keys(caps).length
+        ? "this camera reports no manual exposure, white balance or focus"
+        : "this browser does not report camera capabilities" });
+  }
+
+  /* One at a time, so a rejection costs only the one it was for. */
+  const got = [];
+  for (const k of asked) {
+    try { await track.applyConstraints({ advanced: [{ [k]: want[k] }] }); got.push(k); }
+    catch { /* unsupported in practice despite being advertised */ }
+  }
+  let settings = {};
+  try { settings = track.getSettings ? track.getSettings() : {}; } catch {}
+  camLock = { ok: got.length > 0, asked, got, caps: Object.keys(caps),
+    why: got.length ? "" : "the camera refused every lock it advertised",
+    exposureTime: settings.exposureTime ?? null,
+    iso: settings.iso ?? null,
+    colorTemperature: settings.colorTemperature ?? null };
+  log?.add(Shift.EV.CAMERA_LOCKED, { got, asked });
+  return camLock;
+}
+
+function paintCamLock() {
+  const n = $("camLockNote");
+  if (!camLock) { n.className = "note"; n.textContent = ""; return; }
+  n.className = "note " + (camLock.ok ? "ok" : "warn");
+  n.textContent = camLock.ok
+    ? `Camera locked: ${camLock.got.join(", ")}.` +
+      (camLock.exposureTime ? ` Exposure ${camLock.exposureTime}, ISO ${camLock.iso ?? "?"}.` : "") +
+      (camLock.asked.length > camLock.got.length
+        ? ` Refused: ${camLock.asked.filter(k => !camLock.got.includes(k)).join(", ")}.` : "")
+    : `Camera NOT locked — ${camLock.why}. ` +
+      `Exposure and white balance will keep drifting; lock them in the camera app if it allows it.`;
+}
+
+$("camLockBtn").onclick = async () => {
+  if (!stream) {
+    $("camLockNote").className = "note warn";
+    $("camLockNote").textContent = "Start the camera first.";
+    return;
+  }
+  $("camLockNote").className = "note";
+  $("camLockNote").textContent = "Letting exposure settle, then locking…";
+  await lockCamera();
+  paintCamLock();
+};
+
 $("srcCam").onclick = async () => {
   stopRun(); releaseFile();
   try {
@@ -718,9 +909,14 @@ $("srcCam").onclick = async () => {
   // (1280x720), and every measurement uses the element -- so quoting the
   // track made the app look misconfigured when it was not.
   $("calHint").textContent = `Camera at ${vid.videoWidth}×${vid.videoHeight}. Two stills, ` +
-    `nothing in between: a full bobbin, then the bare tube in the same place. ` +
-    `Lock exposure and white balance first if the camera app allows it.`;
+    `nothing in between: a full bobbin, then the bare tube in the same place.`;
   resumeShift();
+  /* Lock once the stream is up and AE has had a moment. Not awaited: calibration
+     and the preview should not wait on it, and a camera that cannot lock must
+     not hold up a run. Press Lock camera again after re-aiming. */
+  $("camLockNote").className = "note";
+  $("camLockNote").textContent = "Letting exposure settle, then locking…";
+  lockCamera().then(paintCamLock).catch(() => {});
 };
 
 $("srcFile").onclick = () => $("playFile").click();
@@ -743,7 +939,8 @@ $("playFile").onchange = async e => {
 function segment(onId) {
   ["srcCam", "srcFile"].forEach(id => $(id).classList.toggle("on", id === onId));
 }
-function stopCamera() { if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; } }
+function stopCamera() {
+  camLock = null; paintCamLock(); if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; } }
 function releaseFile() { if (vid.src) { vid.pause(); vid.removeAttribute("src"); vid.load(); } }
 
 /* ---- calibration stills ------------------------------------------------
@@ -964,6 +1161,11 @@ $("reset").onclick = () => {
   endIntervention("reset");
   log?.add(Shift.EV.RUN_RESET, { peakPct: +clamped.toFixed(1) });
   machineMoving = false;
+  traceShot("reset pressed");
+  /* Before resetRun and the reseed, both of which replace this bobbin's frames
+     with the next one's. This is the only moment the finished bobbin's pair
+     still exists. */
+  offerAutoCalibration();
   resetRun();
   openJoin();
   $("runNote").className = "note";
@@ -988,10 +1190,18 @@ function resetRun() {
   stopAt = undefined;
   noiseFloor = null; noiseSamples = []; prevFull = null;
   prevMotion = null; hotCount = null; warmSamples = 0; warmFrames = [];
+  armAttempts = 0;
   motionMask = null; maskBuf = prevMaskBuf = null;
   motionOutside = null; outBuf = prevOutBuf = null;
-  if (alertKind === "stopped") hideAlertScreen();
+  /* Whatever alert is up, not just a stop. Reset means a new scrap bobbin is
+     on, so a depletion alert about the one just taken off is stale the instant
+     it is pressed -- and this line used to leave that screen up, flashing and
+     announcing "Bobbin low" every 2s over the new bobbin, for the rest of the
+     run. Everything else here already treats the depletion state as reset:
+     `fired` goes false and clearRepeats has run. Only the screen was forgotten. */
+  if (alertKind) hideAlertScreen();
   $("faultNote").textContent = ""; $("mMotion").textContent = "";
+  liveRun = []; liveStill = []; paintBaseline();
   window_ = []; clamped = 0; consecutive = 0; fired = false; lastSampleT = -Infinity;
   $("pct").textContent = "—"; $("fill").style.width = "0"; $("fill").className = "";
   $("mState").textContent = running ? "monitoring" : "idle";
@@ -1038,6 +1248,69 @@ const RESEED_MAX = 25;
  * opening reading drifts from run to run when one calibration is reused, and
  * why refreshing the full-bobbin half of it is enough to pull every run back
  * to near zero. */
+/* Try the pair this bobbin produced. Returns a calibration, or why not --
+   CV.calibrate already refuses a fit that would be useless downstream and says
+   so in a sentence an operator can act on, so the refusal is worth showing
+   rather than swallowing. */
+function tryAutoCalibration() {
+  if (!autoWound || !autoBare) return { why: "no pair from this bobbin yet" };
+  if (autoWound.width !== autoBare.width || autoWound.height !== autoBare.height)
+    return { why: "the camera resolution changed mid-bobbin" };
+  try { return { fit: CV.calibrate(autoWound, autoBare) }; }
+  catch (err) { return { why: err.message }; }
+}
+
+/* Called when a bobbin is swapped, BEFORE the reseed replaces autoWound with
+   the new bobbin's frame. */
+function offerAutoCalibration() {
+  const res = tryAutoCalibration();
+  if (!res.fit) {
+    /* Quiet about "no pair yet" -- that is every bobbin that never ran down
+       far enough, which is normal and not worth a message each time. */
+    if (autoBare) {
+      $("autoCalNote").className = "note";
+      $("autoCalNote").textContent =
+        `The last bobbin did not give a usable calibration: ${res.why}`;
+    }
+    return;
+  }
+  const f = res.fit;
+  autoOffer = { wound: autoWound, bare: autoBare, fit: f };
+  $("autoCalRow").classList.remove("hidden");
+  $("autoCalNote").className = "note ok";
+  $("autoCalNote").textContent =
+    `The last bobbin ran down to ${autoBarePct.toFixed(0)}%, so it can be used as a fresh ` +
+    `calibration — no empty tube needed. It fits ${f.baselinePct}% full → ${f.ceilingPct}% bare ` +
+    `(warmth >${f.creamWarm}, region ${f.regionAspect}:1)` +
+    (cal ? `, against the current ${cal.baselinePct}% → ${cal.ceilingPct}% (warmth >${cal.creamWarmFit ?? cal.creamWarm}).` : ".") +
+    (f.warning ? " " + f.warning : "");
+}
+
+function clearAutoOffer() {
+  autoOffer = null;
+  $("autoCalRow").classList.add("hidden");
+  $("autoCalNote").textContent = "";
+}
+
+$("autoCalBtn").onclick = () => {
+  if (!autoOffer) return;
+  /* Through applyCalibration, so the stored shape, refSmall, the chip and the
+     message are identical to a hand-captured fit -- there is one way a
+     calibration gets installed, whatever produced the frames. */
+  if (applyCalibration(autoOffer.wound, autoOffer.bare, "the last bobbin")) {
+    log?.add(Shift.EV.CALIBRATION_APPLIED,
+      { baseline: cal.baselinePct, ceiling: cal.ceilingPct, creamWarm: cal.creamWarm,
+        from: "auto" });
+    drawThumb("thumbBare", autoOffer.bare);
+  }
+  clearAutoOffer();
+};
+$("autoCalNo").onclick = () => {
+  clearAutoOffer();
+  $("autoCalNote").className = "note";
+  $("autoCalNote").textContent = "Kept the current calibration.";
+};
+
 function reseedBaseline() {
   const img = frameData();
   if (!img) return;
@@ -1048,6 +1321,11 @@ function reseedBaseline() {
            `the bobbin is not full. Monitoring with the stored baseline instead.`, "warn");
     return;
   }
+  /* This frame is the full-bobbin half of the next auto-calibration: it has
+     just been checked to read under RESEED_MAX, so it really is a full bobbin,
+     which is the one thing CV.calibrate cannot verify for itself. */
+  autoWound = img;
+  autoBare = null; autoBarePct = 0;
   cal.creamWarm = CV.creamThresholdFor(img, cal);
   cal.baselinePct = Math.round(CV.measure(img, cal) * 100) / 100;
   cal.refSmall = Array.from(CV.downsampleGray(img, 32, 18));
@@ -1121,10 +1399,14 @@ async function startRun({ resume = false } = {}) {
        operator is back, or it runs to the horizon and charges the rest of the
        shift to the time the app was away. */
     const hiddenAt = Shift.openPauseAt(pendingOpenShift.events);
-    if (hiddenAt !== null)
+    if (hiddenAt !== null) {
       log.add(Shift.EV.APP_RESUMED,
               { hiddenFor: Math.round((Date.now() - hiddenAt) / 1000), by: "restored" });
+    } else {
+      restoredGap = accountForGap(pendingOpenShift, log);
+    }
     pendingOpenShift = null;
+    store.set(BEAT_KEY, null);
   } else if (!log) {
     shiftNo += 1; store.set("shiftNo", shiftNo);
     log = Shift.createLog(shiftNo, { onAdd: saveOpenShift });
@@ -1142,13 +1424,19 @@ async function startRun({ resume = false } = {}) {
   updateStart();
   $("dot").className = "dot live"; $("mState").textContent = "monitoring";
   $("runNote").className = "note";
-  $("runNote").textContent = resume
-    ? `Monitoring resumed — stop detection re-arms in ${MOTION_WARMUP}s.` : "";
+  $("runNote").textContent = restoredGap
+    ? `Carried the shift on. The ${mmss(restoredGap.away)} the app was closed is recorded as `
+      + `idle${restoredGap.moving ? ", and the run it was in the middle of was closed at that point" : ""}`
+      + ` — not as production, and not as a machine fault.`
+    : resume ? `Monitoring resumed — stop detection re-arms in ${MOTION_WARMUP}s.` : "";
+  restoredGap = null;
+  startBeating();
   loop();
 }
 
 function stopRun() {
   running = false;
+  traceFlush();
   clearRepeats(); clearFault();
   closeJoin("stopped");   // a no-op when endShift already closed it
   cancelAnimationFrame(rafId);
@@ -1174,8 +1462,10 @@ function loop() {
 
   const img = frameData();
   if (!img) return;
+  traceBegin(now);
   const detail = measureDetail(img);
   drawOverlay(detail);
+  traceSet("warm", detail.warmMax);
   if (detail.pct === null) return;
 
   /* The raw signal next to the threshold it has to clear. A percentage stuck
@@ -1183,6 +1473,14 @@ function loop() {
      camera has neutralised the tube, or the tube simply is not bare yet --
      and these need completely different fixes. The warmest pixel actually
      inside the region separates them at a glance. */
+  traceSet("pct", +clamped.toFixed(1));
+  /* The best bare-tube frame this bobbin has produced. The most exposed one,
+     not the first past the line -- the tube keeps emerging until the bobbin is
+     swapped, and a fuller view fits a better region. Costs one ImageData;
+     getImageData hands back a fresh buffer, so holding it is safe. */
+  if (clamped >= AUTO_BARE_PCT && clamped > autoBarePct) {
+    autoBare = img; autoBarePct = clamped;
+  }
   const warmThr = cal.creamWarm ?? CV.CREAM_WARM;
   $("mWarm").textContent = `warm ${detail.warmMax}/${warmThr}`;
   $("mWarm").style.color = detail.warmMax < warmThr ? "var(--amber)" : "";
@@ -1252,6 +1550,7 @@ function checkStopped(img, grid) {
     const f = CV.noiseFloorFor(full, prevFull);
     if (f !== null) noiseSamples.push(f);
     prevMotion = motion; prevFull = full; prevGrid = grid;
+    traceSet("phase", "noise");
     $("mMotion").textContent = `calibrating noise · ${Math.ceil(NOISE_WARMUP - age)}s`;
     $("mMotion").style.color = "";
     return;
@@ -1272,6 +1571,7 @@ function checkStopped(img, grid) {
     if (left > 0) {
       runStartedAt = performance.now() / 1000 - NOISE_WARMUP;
       prevMotion = motion; prevFull = full; prevGrid = grid;
+      traceSet("phase", "join");
       $("mMotion").textContent = `tow join · stop detection waits ${Math.ceil(left)}s`;
       $("mMotion").style.color = "";
       $("mState").textContent = "joining tow";
@@ -1302,6 +1602,8 @@ function checkStopped(img, grid) {
     }
     prevMotion = motion; prevFull = full; prevGrid = grid;
     const live = (100 * hitsNow) / motion.length;
+    traceSet("phase", "learn");
+    traceSet("whole", +live.toFixed(2));
     /* Labelled "frame" because this is the WHOLE-frame fraction, diluted by
        every static pixel -- not the masked level that arming is judged on, which
        runs an order of magnitude higher. It is here to answer one question:
@@ -1313,74 +1615,76 @@ function checkStopped(img, grid) {
   }
 
   if (stopAt === undefined) {
-    /* Frequency of exceedance, not average magnitude. A mean has breakdown
-       point zero: one person crossing the frame owns those pixels and the
-       mask follows them off the machine. An indicator saturates at 1. */
-    const idx = [];
-    if (hotCount) for (let k = 0; k < hotCount.length; k++)
-      if (hotCount[k] / warmSamples >= HOT_FRAC) idx.push(k);
-    motionMask = idx.length >= MIN_MASK ? Int32Array.from(idx) : null;
-    if (motionMask) {
+    /* The arming judgement lives in CV.armingDecision, with the measurements
+       that set its two gates. Keeping it there rather than here is what lets
+       tests/arming.test.js score it against footage -- and it used to be here,
+       scoring the mask on the same frames it was fitted to, which is why a
+       stopped machine could arm and then never report a stop. */
+    const [gCols, gRows] = CV.gridSize(img.width, img.height, MOTION_STEP);
+    const decision = CV.armingDecision({
+      frames: warmFrames, floor: noiseFloor, cols: gCols, rows: gRows,
+      hotFrac: HOT_FRAC, minMask: MIN_MASK,
+    });
+    warmFrames = [];                  // several MB at 1280px; it has done its job
+    armAttempts += 1;
+    if (trace) {
+      /* Every field, not just the verdict. Re-tuning the gates offline means
+         replaying these through CV.armingDecision, so a row that kept only
+         "refused" would record the answer and throw away the question. */
+      trace.arms.push({
+        t: Math.round((performance.now() / 1000 - trace.clock0) * 10) / 10,
+        attempt: armAttempts, ok: decision.ok, why: decision.why,
+        maskSize: decision.maskSize, samples: decision.samples,
+        level: decision.level, heldLevel: decision.heldLevel,
+        surround: decision.surround,
+        ratio: decision.ratio === Infinity ? null : decision.ratio,
+        frameShare: decision.frameShare, stopAt: decision.stopAt,
+        floor: noiseFloor, joinWaiting,
+      });
+      traceShot(decision.ok ? `armed (attempt ${armAttempts})`
+                            : `refused (attempt ${armAttempts})`);
+    }
+
+    if (decision.ok) {
+      motionMask = decision.mask;
+      stopAt = decision.stopAt;
       maskBuf = new Float32Array(motionMask.length);
       prevMaskBuf = new Float32Array(motionMask.length);
       // Everything else in the frame, less a fringe round the mask: what a
       // restart is checked against. See RESTART_RATIO in cv.js.
-      motionOutside = CV.outsideIndices(motionMask, ...CV.gridSize(img.width, img.height, MOTION_STEP));
+      motionOutside = decision.outside;
       outBuf = new Float32Array(motionOutside.length);
       prevOutBuf = new Float32Array(motionOutside.length);
-      const levels = [];
-      /* Two different buffers, or the second gather overwrites the first and
-         every pair compares a frame with itself -- which reads as a dead
-         still machine and arms the detector at zero. */
-      for (let j = 1; j < warmFrames.length; j++)
-        levels.push(CV.changedFraction(gatherMask(warmFrames[j], maskBuf),
-                                       gatherMask(warmFrames[j - 1], prevMaskBuf), noiseFloor));
-      levels.sort((a, b) => a - b);
-      /* The mask is pixels hot in at least HOT_FRAC of samples, so the MEAN
-         per-sample reading cannot be below HOT_FRAC. A q25 under CF_RUNNING_MIN
-         therefore means the window was uneven, not weak -- and the median and
-         peak say by how much, which is the whole diagnosis. */
-      const pick = q => levels.length ? levels[Math.floor(q * (levels.length - 1))] : 0;
-      /* The 25th percentile, not the median. The machine's speed varies by
-         design, so the middle of the warm-up says nothing about its slowest
-         running moment -- and the slowest running moment is the thing the
-         threshold must stay under. Measured on the reference clip, this lifts
-         the tightest running-to-threshold margin from 1.41x to 1.65x at no
-         cost in arming or detection. */
-      const level = pick(0.25);
-      stopAt = CV.cfStopThresholdFrom(level);
-      warmFrames = [];                     // several MB at 1280px; it has done its job
-      /* Refusing to arm matters more than it looks. A detector that learned its
-         baseline from an already-stopped machine would never fire again, and
-         would be indistinguishable from one quietly working. */
-      $("faultNote").className = "note" + (stopAt === null ? " warn" : "");
-      $("faultNote").textContent = stopAt === null
-        ? `Stop detection NOT armed — ${motionMask.length} moving points found, but the ` +
-          `reading was uneven across the first ${MOTION_WARMUP}s: ` +
-          `quarter ${level.toFixed(1)}%, middle ${pick(0.5).toFixed(1)}%, ` +
-          `best ${pick(1).toFixed(1)}% (floor ${noiseFloor.toFixed(0)}). ` +
-          `Arming needs the quarter mark above ${CV.CF_RUNNING_MIN}%.`
-        : `Stop detection armed: ${motionMask.length} moving points, running at ` +
-          `${level.toFixed(1)}%, noise floor ${noiseFloor.toFixed(0)}, ` +
-          `reports stopped below ${stopAt.toFixed(1)}%.`;
-      /* A mask formed, so something was moving: the tow join came good and the
-         bobbin is turning. If the alarm had already gone off for a join that
-         looked dead, leave faultFired set -- the ordinary self-clear below sees
-         RESUME_HOLD of motion and withdraws it, which is the same path a real
-         stop takes and needs no special case here. */
-      if (stopAt !== null && joinWaiting) closeJoin("motion");
-    } else if (joinWaiting) {
-      /* The join window is up and still nothing is moving. The bobbin starts
-         turning by itself once the tow is joined, so this is the machine not
-         starting -- the one case where a refusal to arm is a diagnosis about
-         the MACHINE rather than about the camera. Raise the stop alarm.
+      $("faultNote").className = "note";
+      $("faultNote").textContent =
+        `Stop detection armed: ${motionMask.length} moving points, running at ` +
+        `${decision.level.toFixed(1)}%, holding ${decision.heldLevel.toFixed(1)}% held out ` +
+        `at ${decision.ratio === Infinity ? "∞" : decision.ratio.toFixed(0)}× the surround, ` +
+        `noise floor ${noiseFloor.toFixed(0)}, reports stopped below ${stopAt.toFixed(1)}%.`
+        + (armAttempts > 1 ? ` Armed on attempt ${armAttempts}.` : "");
+      armAttempts = 0;
+      /* Something was really moving, so a tow join came good and the bobbin is
+         turning. If the alarm had already gone off for a join that looked dead,
+         leave faultFired set -- the ordinary self-clear below sees RESUME_HOLD
+         of motion and withdraws it, the same path a real stop takes. */
+      if (joinWaiting) closeJoin("motion");
 
-         Then keep looking, rather than giving up as the branch below does. A
-         join that ran long is the likeliest cause, and the operator has been
-         told; if the bobbin starts a minute late the next attempt arms, and the
-         ordinary self-clear withdraws the alarm on RESUME_HOLD of motion. One
-         alarm per join, however many attempts it takes. */
-      if (!joinAlarmed) {
+    } else {
+      /* REFUSED -- and then try again, rather than giving up for the rest of
+         the run. Latching off is what made stop detection "work sometimes":
+         one bad fifteen seconds, usually a machine that happened to be stopped
+         while the warm-up ran, and the detector was off until the next Reset,
+         saying so only in a note nobody was looking at. The machine may start
+         at any moment, so the right response to "that was not a running
+         machine" is to look again, not to stop looking. */
+      motionMask = null; stopAt = undefined;
+      hotCount = null; warmSamples = 0;
+      runStartedAt = performance.now() / 1000 - NOISE_WARMUP;   // another phase 2
+
+      /* After a tow join the window is up and the bobbin should be turning, so
+         a refusal is a diagnosis about the MACHINE and not the camera: raise
+         the stop alarm, once, however many attempts it then takes. */
+      if (joinWaiting && !joinAlarmed) {
         joinAlarmed = true;
         faultFired = true; stoppedSince = Date.now();
         fireFault();
@@ -1388,24 +1692,12 @@ function checkStopped(img, grid) {
         $("faultNote").textContent =
           `Bobbin not turning ${joinWindow}s after Reset — the tow join should be done by now. ` +
           `Still watching: if it starts, this clears itself.`;
+      } else {
+        $("faultNote").className = "note warn";
+        $("faultNote").textContent =
+          `Stop detection not armed yet (attempt ${armAttempts}) — ${decision.why}. ` +
+          `Looking again for ${MOTION_WARMUP - NOISE_WARMUP}s.`;
       }
-      /* Another go at phase 2, noise floor kept -- it was measured on a still
-         machine during the join, which is where it is most reliable. */
-      stopAt = undefined;
-      hotCount = null; warmSamples = 0; warmFrames = [];
-      runStartedAt = performance.now() / 1000 - NOISE_WARMUP;
-    } else {
-      /* Too few moving points is its own diagnosis, and a different one from
-         "nothing moved": it means the camera can see the machine but nothing
-         in view has enough texture to track. Say so rather than blaming the
-         machine for standing still. */
-      stopAt = null;
-      warmFrames = [];
-      $("faultNote").className = "note warn";
-      $("faultNote").textContent =
-        `Stop detection NOT armed — ${idx.length} moving points found in the first ` +
-        `${MOTION_WARMUP}s, need ${MIN_MASK}. Aim the camera so a moving edge is in view, ` +
-        `then press Reset.`;
     }
   }
 
@@ -1431,6 +1723,22 @@ function checkStopped(img, grid) {
     return;
   }
   lastMotion = m;
+  /* Known-still comes from the operator, not from the detector: inside a join
+     window they have pressed Reset and are joining the tow. Using the
+     detector's own verdict to score the detector would be circular. */
+  if (stopAt !== null && attendedSince === null) {
+    const bucket = joinUntil !== null || joinWaiting ? liveStill : machineMoving ? liveRun : null;
+    if (bucket && bucket.length < LIVE_MAX) bucket.push(m);
+    if ((liveRun.length + liveStill.length) % 20 === 0) paintBaseline();
+  }
+  traceSet("phase", stopAt === null ? "unarmed" : "armed");
+  traceSet("mask", +m.toFixed(2));
+  if (o !== null) traceSet("outside", +o.toFixed(2));
+  traceSet("stopAt", stopAt === null ? null : +stopAt.toFixed(2));
+  traceSet("quietFor", quietFor);
+  traceSet("movingFor", movingFor);
+  traceSet("moving", machineMoving);
+  traceSet("attended", attendedSince !== null);
   if (stopAt === null) {
     $("mMotion").textContent = `motion ${m.toFixed(1)}% · stop detection off`;
     return;
@@ -1547,6 +1855,7 @@ function fireFault() {
   /* Two beeps, not the depletion alarm. A stop costs idle time and nothing
      else, so it gets a sound you can tell apart from the one that means walk
      to the machine now. */
+  traceShot("machine stopped");
   if (audio) { const t = audio.currentTime; beep(t, 440, 0.18); beep(t + 0.3, 330, 0.28); }
   showAlertScreen("stopped", "MACHINE STOPPED",
     `The unwind bobbin has stopped turning — go and look.`);
@@ -1815,7 +2124,13 @@ function burst() {
   [0, 0.26, 0.52].forEach((off, i) => beep(t + off, i % 2 ? 660 : 990, 0.2));
 }
 function startAlarm() {
-  if (alarmTimer) return;
+  /* Restart rather than refuse. The guard here used to be `if (alarmTimer)
+     return`, which made one leaked timer anywhere silence every future alert --
+     a failure whose only symptom is the absence of a sound, which is the
+     hardest kind to notice and the worst kind to have. Both callers mean "an
+     alert has just fired", so starting clean is always right, and the newest
+     alertKind wins. */
+  clearAlarm();
   startSaying(alertKind);
   burst();
   alarmTimer = setInterval(burst, 1800);
@@ -1830,7 +2145,17 @@ function showAlertScreen(kind, title, message) {
 }
 
 function hideAlertScreen() {
-  stopSaying();
+  /* clearAlarm, not stopSaying. Hiding the screen IS ending the alert, so the
+     beeps and the flashing have to stop with it -- and stopSaying only covered
+     the speech. resetRun and the stop-detection toggle both tear an alert down
+     through this function, so each of them left alarmTimer and flashTimer
+     running: beeping every 1.8s with no screen to explain it, and worse,
+     startAlarm's guard then saw a live alarmTimer and returned early for the
+     REST OF THE SESSION. Every later stop showed its screen, beeped the two
+     opening beeps from fireFault, and then went quiet, while ntfy carried on
+     repeating from its own ticker -- an alert that looked fine on the phone and
+     was mute on the tablet. */
+  clearAlarm();
   alertKind = null;
   $("alert").classList.add("hidden");
   $("alert").classList.remove("flash", "stopped");
@@ -1891,6 +2216,7 @@ $("alertAttend").onclick = () => { if (alertKind) acknowledge(); startInterventi
    notification shade -- are recorded too. The log keeps what happened; deciding
    what it means is the derivation's job, not this function's. */
 function pauseForHidden() {
+  beat();                   // the last moment we know we were watching
   if (!running || !log || hiddenSince !== null) return;
   hiddenSince = Date.now();
   log.add(Shift.EV.APP_PAUSED);
@@ -2070,6 +2396,77 @@ function saveOpenShift() {
                         clamped, savedAt: Date.now() });
 }
 
+/* --- the heartbeat -------------------------------------------------------
+ * saveOpenShift fires on every event, so savedAt is the time of the last
+ * EVENT, not the last moment the app was alive. A machine running quietly
+ * produces no events, so a reload after ten quiet minutes would look, on the
+ * way back, as though we lost contact ten minutes before we did -- and ten
+ * minutes of real production would be booked as idle. The heartbeat is what
+ * makes the gap measurable instead of guessed.
+ *
+ * It is a separate, tiny key on purpose: the open shift carries the whole
+ * event array, which grows all shift, and rewriting that every few seconds to
+ * record one number would be a few hundred KB of writes a minute for nothing. */
+const BEAT_KEY = "openBeat";
+const BEAT_S = 5;
+let beatTimer = null;
+
+function beat() {
+  if (!log) return;
+  store.set(BEAT_KEY, { at: Date.now(), moving: machineMoving, running });
+}
+function startBeating() {
+  if (beatTimer) return;
+  beat();
+  beatTimer = setInterval(beat, BEAT_S * 1000);
+}
+function stopBeating() {
+  clearInterval(beatTimer); beatTimer = null;
+}
+
+/* The moment we last know the app was alive, and what the machine was doing
+   then. Falls back to the last event if the heartbeat is missing -- an older
+   build wrote no heartbeat, and a shift carried across an upgrade is exactly
+   when this runs. */
+/* The time the app was closed, written into the log as what it was: not
+ * watching. The page went without warning -- a reload to pick up a new build, a
+ * crash, the tablet rebooting -- so no pause was recorded on the way out.
+ * visibilitychange is not guaranteed on a navigation, which makes this the
+ * common case rather than the rare one, and it is the dangerous one: the last
+ * event is usually motion.started, nothing closes that span, and the derivation
+ * reads the whole absence as production. Measured on a 1210 s fixture with a
+ * ten minute reload in it: 1140 s running at 100% utilisation, against a true
+ * 535 s and 46.9%.
+ *
+ * Three things have to happen, and the order matters. The running span is
+ * closed at the moment contact was lost, not at the press, or the gap stays
+ * inside it. The stop carries by: "reload", so it is idle without ever being
+ * counted as a machine fault. And the gap itself is a pause pair, which is the
+ * same shape 6.7 uses for a minimize because it means the same thing. */
+function accountForGap(open, into) {
+  const alive = lastAlive(open);
+  /* One reading of the clock for all three events, passed explicitly. Letting
+     the resume default its own timestamp would read the clock again a moment
+     later, and would read it inside shift.js rather than here -- so the pause
+     and the resume could disagree about when "now" was. */
+  const back = Date.now();
+  const away = Math.round((back - alive.at) / 1000);
+  if (!alive.at || away < GAP_MIN_S) return null;
+  if (alive.moving) into.add(Shift.EV.MOTION_STOPPED,
+    { pct: +clamped.toFixed(1), outside: null, by: "reload" }, alive.at);
+  into.add(Shift.EV.APP_PAUSED, { by: "reload" }, alive.at);
+  into.add(Shift.EV.APP_RESUMED, { hiddenFor: away, by: "reload" }, back);
+  return { away, from: alive.from, moving: alive.moving };
+}
+
+function lastAlive(open) {
+  const b = store.get(BEAT_KEY, null);
+  const evAt = open.savedAt || 0;
+  if (b && typeof b.at === "number" && b.at >= evAt)
+    return { at: b.at, moving: !!b.moving, from: "heartbeat" };
+  return { at: evAt, moving: null, from: "last event" };
+}
+
 function restoreOpenShift() {
   const open = store.get(OPEN_KEY, null);
   if (!open || !Array.isArray(open.events) || !open.events.length) return;
@@ -2099,12 +2496,30 @@ $("bobbinDone").onclick = () => {
   const { shift, bobbins } = log.derive({ now: Date.now() });
   const b = bobbins[bobbins.length - 1];
   paintTally();
-  $("sessionNote").className = "note ok";
+
+  /* The shift so far, written out at every completion rather than only at End.
+     The tablet keeps SHIFT_KEEP finished shifts and one open one, so until End
+     is pressed the whole shift exists in exactly one place -- and a completed
+     bobbin is the natural moment to have a copy of it that does not depend on
+     the tablet surviving the rest of the day. Same files, same writer as End;
+     the name carries the bobbin number so a day's exports sort in order and a
+     partial is never mistaken for the finished shift. */
+  let wrote = 0, writeFailed = false;
+  if (autoExportOn) {
+    try {
+      wrote = writeFiles([{ events: log.events, summary: shift }],
+                         `${Shift.fileSlug(shift.name)}-bobbin-${b.seq}-${fileStamp()}`);
+    } catch { writeFailed = true; }
+  }
+
+  $("sessionNote").className = "note " + (writeFailed ? "warn" : "ok");
   $("sessionNote").textContent =
     `Bobbin ${b.seq} completed — ${b.scrapBobbins} scrap bobbin${b.scrapBobbins === 1 ? "" : "s"}, ` +
     `${mmss(b.runSeconds)} running, ${mmss(b.totalIdleSeconds)} idle on it` +
     (b.utilisation !== null ? ` (${b.utilisation}% used)` : "") +
-    `. The idle figure holds on this bobbin until you press Reset for the next one.`;
+    `. The idle figure holds on this bobbin until you press Reset for the next one.` +
+    (writeFailed ? " The shift is saved on the tablet, but its files could not be written."
+     : wrote ? ` ${wrote} file${wrote === 1 ? "" : "s"} of the shift so far saved to Downloads.` : "");
 };
 
 /* ---- operator intervention ----------------------------------------------
@@ -2179,6 +2594,7 @@ function endShift() {
     const kept = [...savedShifts(), record].slice(-SHIFT_KEEP);
     store.set("shifts", kept);
     store.set(OPEN_KEY, null);          // filed, so no longer interrupted
+    stopBeating(); store.set(BEAT_KEY, null);
     /* Write the files only once the shift is safely stored, so a download that
        fails cannot cost us the record. This runs inside the End press, which is
        what allows a download at all -- Chrome refuses one outside a gesture.
@@ -2205,6 +2621,205 @@ function endShift() {
   updateStart();
   paintTally();
 }
+
+/* --- the recorder ---------------------------------------------------------
+   A row is opened at the top of each sample and pushed at the top of the NEXT
+   one. checkStopped returns early from several places -- the noise phase, the
+   join hold, a frame with no previous frame to compare against -- so a row
+   flushed at the end of the sample would be the row that never got written on
+   exactly the samples worth having. */
+function traceBegin(t) {
+  if (!trace) return;
+  traceFlush();
+  traceCur = { t: Math.round(t * 1000) / 1000 };
+}
+function traceFlush() {
+  if (!trace || !traceCur) return;
+  if (trace.rows.length < TRACE_MAX_ROWS) trace.rows.push(traceCur);
+  else trace.truncated = true;
+  traceCur = null;
+}
+const traceSet = (k, v) => { if (traceCur) traceCur[k] = v; };
+
+/* An ImageData as a small JPEG. putImageData cannot scale, so it goes onto a
+   full-size canvas first and is drawn down from there -- the same two-step
+   drawThumb uses. */
+function imageDataJpeg(img, w = SHOT_W, q = 0.6) {
+  if (!img || !img.width) return null;
+  try {
+    const tmp = document.createElement("canvas");
+    tmp.width = img.width; tmp.height = img.height;
+    tmp.getContext("2d").putImageData(img, 0, 0);
+    shotCv.width = w;
+    shotCv.height = Math.max(1, Math.round((w * img.height) / img.width));
+    shotCtx.drawImage(tmp, 0, 0, shotCv.width, shotCv.height);
+    return shotCv.toDataURL("image/jpeg", q);
+  } catch { return null; }
+}
+
+/* A still, downscaled hard. Kept for the moments where a number cannot say
+   whether the camera is looking at the right thing. */
+function traceShot(label) {
+  if (!trace || trace.shots.length >= TRACE_MAX_SHOTS) return;
+  try {
+    const w = vid.videoWidth || 640, h = vid.videoHeight || 480;
+    if (!w || !h) return;
+    shotCv.width = SHOT_W;
+    shotCv.height = Math.max(1, Math.round((SHOT_W * h) / w));
+    shotCtx.drawImage(vid, 0, 0, shotCv.width, shotCv.height);
+    trace.shots.push({ t: Math.round((performance.now() / 1000 - trace.clock0) * 10) / 10,
+                       label, jpeg: shotCv.toDataURL("image/jpeg", 0.5) });
+  } catch { /* a still is a nice-to-have; never let it break a run */ }
+}
+
+function startRecording() {
+  trace = {
+    version: VERSION, build: BUILD,
+    startedAt: Date.now(), clock0: performance.now() / 1000,
+    /* The constants the numbers have to be read against. A trace that does not
+       carry them is uninterpretable six weeks later, when they have moved. */
+    constants: {
+      SAMPLE_S, MOTION_WARMUP, NOISE_WARMUP, MOTION_STEP, HOT_FRAC, MIN_MASK,
+      RESUME_HOLD, joinWindow,
+      ARM_MIN_LEVEL: CV.ARM_MIN_LEVEL, ARM_MIN_RATIO: CV.ARM_MIN_RATIO,
+      ARM_MIN_SURROUND: CV.ARM_MIN_SURROUND,
+      CF_STOP_FRACTION: CV.CF_STOP_FRACTION, CF_STOP_FLOOR: CV.CF_STOP_FLOOR,
+      CF_RUNNING_MIN: CV.CF_RUNNING_MIN, NOISE_PCTL: CV.NOISE_PCTL,
+      RESTART_RATIO: CV.RESTART_RATIO,
+    },
+    /* The whole calibration, and the two stills it was derived from. Every
+       depletion number in the run is relative to these, so a trace without them
+       records readings against a baseline nobody can see. They are also the one
+       thing a later run has to be compared LIKE FOR LIKE against: a changed
+       baseline moves every percentage, and a comparison that missed that would
+       report a recalibration as a change in the machine. */
+    calibration: cal ? {
+      baseline: cal.baseline, ceiling: cal.ceiling, creamWarm: cal.creamWarm,
+      baselinePct: cal.baselinePct, ceilingPct: cal.ceilingPct,
+      gainAt: cal.gainAt, regionAspect: cal.regionAspect, region: cal.region ?? null,
+    } : null,
+    calibrationShots: {
+      full: imageDataJpeg(shotFull),
+      bare: imageDataJpeg(shotBare),
+    },
+    /* Whether exposure and white balance were held still. A run where they were
+       not is a run whose noise floor and whose R-B readings both drift, and
+       without this the trace gives no way to tell that was why. */
+    cameraLock: camLock,
+    frame: { w: vid.videoWidth || null, h: vid.videoHeight || null },
+    rows: [], arms: [], shots: [], truncated: false,
+  };
+  traceCur = null;
+  traceShot("recording started");
+  paintRec();
+  $("recNote").className = "note ok";
+  $("recNote").textContent = "Recording what the detector measures. Press again to save it.";
+}
+
+function stopRecording() {
+  if (!trace) return;
+  traceFlush();
+  traceShot("recording stopped");
+  const t = trace;
+  t.endedAt = Date.now();
+  /* The shift's own events go in, so the trace is self-contained and the
+     operator's presses label it: Reset, Bobbin complete, the alerts, the joins.
+     The ntfy topic is deliberately NOT here -- a trace is a file that gets sent
+     around, and the topic is the one secret this app has. */
+  t.events = log ? log.events : [];
+  trace = null; traceCur = null;
+  paintRec();
+
+  const stamp = fileStamp();
+  const mins = Math.round((t.endedAt - t.startedAt) / 60000);
+  let wrote = 0, failed = false;
+  try {
+    download(`tow-trace-${stamp}.json`, JSON.stringify(t), "application/json");
+    download(`tow-trace-${stamp}.csv`, traceCSV(t), "text/csv");
+    wrote = 2;
+  } catch { failed = true; }
+  $("recNote").className = "note " + (failed ? "warn" : "ok");
+  $("recNote").textContent = failed
+    ? "Recorded, but the files could not be written."
+    : `Saved ${wrote} files to Downloads — ${t.rows.length} samples over ${mins} min, ` +
+      `${t.arms.length} arming attempt${t.arms.length === 1 ? "" : "s"}, ${t.shots.length} stills` +
+      (t.truncated ? ". Stopped recording samples at the 4-hour cap." : ".");
+}
+
+/* The rows as a table, so they can be charted without unpacking the JSON. */
+function traceCSV(t) {
+  const cols = ["t", "phase", "whole", "mask", "outside", "stopAt", "pct", "warm",
+                "moving", "quietFor", "movingFor", "attended"];
+  const rows = t.rows.map(r => cols.map(c => {
+    const v = r[c];
+    return v === undefined || v === null ? "" : typeof v === "boolean" ? (v ? 1 : 0) : v;
+  }).join(","));
+  return [cols.join(","), ...rows].join("\n");
+}
+
+/* How this run is going against the one to beat. The two figures that matter
+   are headroom: how far the slowest running moment sits above the threshold,
+   and how far the threshold sits above what a machine the operator declared
+   still actually reads. The second is only measurable because a tow join is a
+   minute the operator has said the machine is stopped -- so every bobbin swap
+   donates labelled data, and the comparison gets better through the shift. */
+const med = xs => {
+  if (!xs.length) return null;
+  const s = [...xs].sort((a, b) => a - b);
+  return s[s.length >> 1];
+};
+const low = xs => {
+  if (!xs.length) return null;
+  const s = [...xs].sort((a, b) => a - b);
+  return s[Math.floor(0.02 * (s.length - 1))];
+};
+const hi = xs => {
+  if (!xs.length) return null;
+  const s = [...xs].sort((a, b) => a - b);
+  return s[Math.floor(0.98 * (s.length - 1))];
+};
+
+function paintBaseline() {
+  const n = $("baseNote");
+  if (!baseline) { n.className = "note"; n.textContent = ""; return; }
+  const b = baseline.measured || {};
+  if (liveRun.length < 20) {
+    n.className = "note";
+    n.textContent = `Comparing against "${baseline.name}" once the machine has run a little.`;
+    return;
+  }
+  const slowest = low(liveRun), busiest = hi(liveStill), thr = stopAt;
+  const parts = [];
+  const cmp = (now, was, dir, label, unit = "") => {
+    if (now === null || now === undefined) return;
+    if (!Number.isFinite(was)) { parts.push(`${label} ${now.toFixed(1)}${unit}`); return; }
+    const rel = was ? (now - was) / was : 0;
+    const word = Math.abs(rel) < 0.05 ? "≈" : (rel > 0 ? 1 : -1) === dir ? "better" : "worse";
+    parts.push(`${label} ${now.toFixed(1)}${unit} vs ${was.toFixed(1)}${unit} ${word}`);
+  };
+  cmp(slowest, b.running?.q02, +1, "slowest running", "%");
+  if (thr) cmp(slowest / thr, b.marginRunning, +1, "headroom", "×");
+  if (busiest !== null && thr) cmp(thr / busiest, b.marginStopped, +1, "stop headroom", "×");
+  n.className = "note";
+  n.textContent = `vs "${baseline.name}": ` + parts.join(" · ") +
+    (liveStill.length ? "" : " — swap a bobbin to measure stop headroom");
+}
+
+/* Cached with the app shell, so this works with the hotspot off. A missing or
+   malformed baseline is normal before the first run is applied. */
+fetch("./baseline.json", { cache: "no-cache" })
+  .then(r => (r.ok ? r.json() : null))
+  .then(b => { if (b && b.measured) { baseline = b; paintBaseline(); } })
+  .catch(() => {});
+
+function paintRec() {
+  $("recBtn").textContent = trace
+    ? "Stop and download traces" : "Record run (traces)";
+  $("recBtn").classList.toggle("seg", true);
+  $("recBtn").classList.toggle("on", !!trace);
+}
+paintRec();
+$("recBtn").onclick = () => trace ? stopRecording() : startRecording();
 
 /* Shift.exportFiles decides which files there are and what is in them; this
    only hands each one to the browser. Returns how many were written. */
@@ -2242,8 +2857,8 @@ $("autoExportBtn").onclick = () => {
   autoExportOn = !autoExportOn; store.set("autoExportOn", autoExportOn); paintAutoExport();
   $("sessionNote").className = "note" + (autoExportOn ? "" : " warn");
   $("sessionNote").textContent = autoExportOn
-    ? "Ending a shift will save that shift's files to Downloads."
-    : "Ending a shift saves it on the tablet only — press Export data for the files.";
+    ? "Every Bobbin complete, and End, will save the shift's files to Downloads."
+    : "The shift is saved on the tablet only — press Export data for the files.";
 };
 
 function download(name, text, type) {

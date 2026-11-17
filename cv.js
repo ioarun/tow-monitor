@@ -732,7 +732,173 @@ function downsampleGray(imageData, gw, gh) {
   return out;
 }
 
-const CV = { GAIN_MIN, CREAM_WARM, BAND_FRACTION, BASELINE_MAX, CEILING_MIN,
+/* --- arming: is this actually a running machine? --------------------------
+ *
+ * The warm-up learns WHICH pixels move (the mask) and HOW MUCH they move (the
+ * running level), and the stop threshold is a fraction of that level. The whole
+ * thing rests on the warm-up having watched a RUNNING machine. Arming on a
+ * stopped one sets the threshold to the noise and the detector then never fires
+ * again -- indistinguishable, from the outside, from one quietly working.
+ *
+ * The gate that was supposed to prevent that could not. The mask is pixels that
+ * beat the floor in at least HOT_FRAC of samples, and the level was then
+ * measured over those same pixels on those same frames, so it cannot come out
+ * below HOT_FRAC however little was happening: the mask is fitted to the noise
+ * and then scored on its own training data. Measured on the reference clip's
+ * real stopped frames, that armed, with 437 mask points and a 2.0% threshold --
+ * above what a stopped machine itself reads, so no stop could ever be called.
+ * Across 67 sliding warm-up windows the old gate refused exactly none.
+ *
+ * So the mask is chosen on the first half of the warm-up and judged on the
+ * second. Two things are asked of the held-out half, and both have to hold:
+ *
+ *   PERSISTENCE  the same pixels must still be moving. Noise is independent
+ *                between halves, so a mask fitted to it collapses out of
+ *                sample: 13.0% in-sample became 2.9% held out, while a running
+ *                machine held 32.8% -> 32.7%.
+ *   LOCALITY     the mask must move much more than the rest of the frame.
+ *                Noise is everywhere; a bobbin is somewhere. Stopped read 4.6x
+ *                the surround, running 12x to 160x.
+ *
+ * Measured on videos/android/stop_video.mp4 (848x478, 2 fps, floor 7):
+ *
+ *                      held-out level        mask/surround
+ *   stopped (spliced)        2.9%                 4.6x
+ *   running, weakest        10.3%                11.6x
+ *   running, median         36.6%                51.4x
+ *
+ * The gates sit between: ARM_MIN_LEVEL 6%, ARM_MIN_RATIO 8. Both clear the
+ * stopped figures by about 2x and sit below the weakest running window by
+ * about 1.5x, and at those values every one of the 38 fully-running windows in
+ * the clip still arms. The stopped sample is pessimistic -- the clip's labelled
+ * stops are only 4 s long, so a 12 s still window had to be spliced from three
+ * of them, and one contains a hand crossing the frame -- which means the real
+ * separation should be wider, not narrower. There is no footage of a genuinely
+ * idle machine, so these two numbers are the ones to re-measure on the tablet.
+ *
+ * The THRESHOLD is still derived from the in-sample q25, unchanged: it is what
+ * tests/stop.test.js scores against labelled footage, and the held-out level is
+ * a smaller number that would drag the threshold down towards what a stopped
+ * machine reads. Judging whether to arm and deciding where to put the threshold
+ * are different jobs.
+ */
+const ARM_MIN_LEVEL = 6;      // %, held-out q25 over the mask
+const ARM_MIN_RATIO = 8;      // held-out mask level / surround level
+/* There has to be a frame left to compare the mask against. When everything
+ * moves at once -- a lighting change, the camera knocked, the tablet picked up
+ * -- the mask swallows the view and outsideIndices comes back empty, and an
+ * absent surround must not read as "perfectly concentrated": a mask covering
+ * the whole frame is the least localized thing there is. On the reference clip
+ * a real running mask covers 2.2% to 7.6% of the grid and always leaves 78.8%
+ * or more outside it, so this sits about 3x below anything genuine. */
+const ARM_MIN_SURROUND = 0.25;   // of the grid, outside the mask and its margin
+
+function hotMask(frames, floor, hotFrac) {
+  if (!frames || frames.length < 2) return [];
+  const n = frames[0].length;
+  const hot = new Int32Array(n);
+  let samples = 0;
+  for (let i = 1; i < frames.length; i++) {
+    const a = frames[i], b = frames[i - 1];
+    if (!a || !b || a.length !== n || b.length !== n) continue;
+    for (let k = 0; k < n; k++) if (Math.abs(a[k] - b[k]) > floor) hot[k]++;
+    samples++;
+  }
+  if (!samples) return [];
+  const idx = [];
+  for (let k = 0; k < n; k++) if (hot[k] / samples >= hotFrac) idx.push(k);
+  return idx;
+}
+
+/* q25 of the per-sample changed fraction over `idx`, across consecutive frames.
+ * The 25th percentile rather than the median because the machine's speed varies
+ * by design and the threshold has to stay under its SLOWEST running moment. */
+function levelOver(frames, idx, floor, q = 0.25) {
+  if (!idx || !idx.length || !frames || frames.length < 2) return null;
+  const a = new Float32Array(idx.length), b = new Float32Array(idx.length);
+  const gather = (src, buf) => { for (let i = 0; i < idx.length; i++) buf[i] = src[idx[i]]; return buf; };
+  const out = [];
+  for (let j = 1; j < frames.length; j++)
+    out.push(changedFraction(gather(frames[j], a), gather(frames[j - 1], b), floor));
+  if (!out.length) return null;
+  out.sort((x, y) => x - y);
+  return out[Math.floor(q * (out.length - 1))];
+}
+
+/* The whole arming judgement, in one place so the app and the tests cannot
+ * disagree about it -- which is the drift tests/stop.test.js exists to catch.
+ * Returns what to arm with, or why not, plus every figure the refusal message
+ * needs: a refusal nobody can diagnose gets worked around rather than fixed. */
+function armingDecision({ frames, floor, cols, rows, hotFrac, minMask,
+                          minLevel = ARM_MIN_LEVEL, minRatio = ARM_MIN_RATIO,
+                          minSurround = ARM_MIN_SURROUND }) {
+  const n = frames ? frames.length : 0;
+  const mask = hotMask(frames, floor, hotFrac);
+  const out = { mask: null, outside: null, stopAt: null, level: null,
+                heldLevel: null, surround: null, ratio: null, frameShare: null,
+                maskSize: mask.length, samples: n, ok: false, why: "" };
+  if (n < 4) { out.why = "too few frames in the warm-up"; return out; }
+  if (mask.length < minMask) {
+    /* Its own diagnosis, and a different one from "nothing persisted": the
+       camera can see the machine but nothing in view has enough texture to
+       track. Keep the aiming advice the old message carried -- it is the only
+       refusal the operator can actually act on. */
+    out.why = `only ${mask.length} moving points, need ${minMask} — ` +
+              `aim the camera so a moving edge is in view`;
+    return out;
+  }
+
+  /* Chosen on the first half, judged on the second. */
+  const half = Math.floor(n / 2);
+  const fit = frames.slice(0, half), test = frames.slice(half);
+  const fitMask = hotMask(fit, floor, hotFrac);
+  out.level = levelOver(frames, mask, floor);          // in-sample: the threshold
+  const grid = cols * rows;
+  out.frameShare = grid > 0 ? mask.length / grid : 0;
+  let surroundIdx = [];
+  if (fitMask.length >= minMask) {
+    surroundIdx = outsideIndices(Int32Array.from(fitMask), cols, rows);
+    out.heldLevel = levelOver(test, fitMask, floor);
+    out.surround = levelOver(test, surroundIdx, floor);
+    /* Only a measured surround can say anything. null means there was none to
+       measure, which is a refusal below, never a free pass. */
+    out.ratio = out.surround !== null && out.surround > 0 ? out.heldLevel / out.surround
+              : out.surround === 0 ? Infinity : null;
+  }
+
+  if (grid > 0 && surroundIdx.length / grid < minSurround) {
+    out.why = `the mask covers ${(100 * out.frameShare).toFixed(0)}% of the view, leaving ` +
+              `${(100 * surroundIdx.length / grid).toFixed(0)}% to compare it against — ` +
+              `that is the whole frame moving at once, not a bobbin`;
+    return out;
+  }
+  if (out.heldLevel === null) { out.why = "the first half of the warm-up found no stable points"; return out; }
+  if (out.heldLevel < minLevel) {
+    out.why = `the points that moved early stopped moving: ${out.heldLevel.toFixed(1)}% held out ` +
+              `against ${out.level.toFixed(1)}% while learning, need ${minLevel}%. ` +
+              `That is what sensor noise looks like, not a turning bobbin`;
+    return out;
+  }
+  if (out.ratio === null || out.ratio < minRatio) {
+    out.why = `the whole frame is moving, not the bobbin: mask ${out.heldLevel.toFixed(1)}% ` +
+              `against ${out.surround.toFixed(1)}% around it, ${out.ratio.toFixed(1)}x, need ${minRatio}x`;
+    return out;
+  }
+  const stopAt = cfStopThresholdFrom(out.level);
+  if (stopAt === null) {
+    out.why = `running level ${out.level.toFixed(1)}% is under ${CF_RUNNING_MIN}%`;
+    return out;
+  }
+  out.mask = Int32Array.from(mask);
+  out.outside = outsideIndices(out.mask, cols, rows);
+  out.stopAt = stopAt;
+  out.ok = true;
+  return out;
+}
+
+const CV = { ARM_MIN_LEVEL, ARM_MIN_RATIO, ARM_MIN_SURROUND,
+             hotMask, levelOver, armingDecision,
+             GAIN_MIN, CREAM_WARM, BAND_FRACTION, BASELINE_MAX, CEILING_MIN,
              ASPECT_TOLERANCE, ANALYSIS_MAX,
              sampleGray, noiseFloorFor, changedFraction, cfStopThresholdFrom,
              NOISE_PCTL, CF_STOP_FRACTION, CF_STOP_FLOOR, CF_RUNNING_MIN,

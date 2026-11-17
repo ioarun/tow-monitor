@@ -40,6 +40,7 @@ const EV = {
   APP_RESUMED:            "app.resumed",           // { hiddenFor } seconds it was away
   JOIN_STARTED:           "join.started",          // Reset: the tow is being joined
   JOIN_ENDED:             "join.ended",            // { by: "motion" | "reset" | "end" | "stopped" }
+  CAMERA_LOCKED:          "camera.locked",         // { got, asked } exposure/WB/focus
 };
 
 /* A run that ended with no alert is either one we failed to warn about or one
@@ -55,6 +56,13 @@ const MISS_ABOVE_PCT = 50;
  * bobbin feeding it, which usually still has tow on it and carries straight on
  * into the next one. They are independent events that happen to be adjacent. */
 const CLOSERS = [EV.RUN_RESET, EV.SHIFT_ENDED];
+
+/* Stops the APP caused by not watching, rather than stops the machine made.
+ * They are idle either way -- the seconds are real and stay in the figures --
+ * but they must never reach faultStops, which is a measure of the MACHINE.
+ * A set rather than a string test, because the list has grown twice: the app
+ * going to the background (6.7), and then the page being reloaded (6.14). */
+const NOT_THE_MACHINE = new Set(["paused", "reload"]);
 
 const sum = xs => xs.reduce((a, b) => a + b, 0);
 const secs = ms => Math.round(ms / 100) / 10;      // one decimal, in seconds
@@ -306,7 +314,7 @@ function derive(events, { now = null, missAbovePct = MISS_ABOVE_PCT } = {}) {
          it: a figure meant to measure the machine must not count a stop the
          operator caused by taking the tablet away. The seconds are still idle;
          only the blame changes. */
-      const kind = spans[i].stopBy === "paused" ? "paused"
+      const kind = NOT_THE_MACHINE.has(spans[i].stopBy) ? "paused"
                  : alert && g.start >= alert.t ? "pause" : "fault";
       stops.push({ ...g, kind, seconds: secs(net(g.start, g.end)), exposurePct: spans[i].stopPct });
       idle.push({ ...g, kind });
