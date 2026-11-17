@@ -272,6 +272,9 @@
         <button id="bobbinDone" disabled>Bobbin complete</button>
         <button id="exportBtn">Export data</button>
       </div>
+      <div class="row">
+        <button id="autoExportBtn">Auto export</button>
+      </div>
       <p class="note" id="sessionNote"></p>
     </section>
 
@@ -298,6 +301,14 @@
         <input type="number" id="stopEvery" min="5" max="60" step="1" style="max-width:5em">
         <span class="note" style="margin:0">s</span>
       </div>
+
+      <div class="row">
+        <span class="note" style="margin:0;flex:1">Tow join after Reset takes</span>
+        <input type="number" id="joinWindow" min="15" max="300" step="5" style="max-width:5em">
+        <span class="note" style="margin:0">s</span>
+      </div>
+      <p class="note" id="joinNote">Stop detection waits this long after Reset while the tow
+        is joined, then expects the bobbin to be turning. The wait counts as idle.</p>
 
       <p class="note" id="ntfyNote"></p>
     </section>
@@ -357,8 +368,8 @@ const gctx = grab.getContext("2d", { willReadFrequently: true });
    time at the machine more than once: the service worker is cache-first, so a
    reload can show the old shell while the new one installs behind it. A build
    string settles that in a glance instead of by hunting for a changed word. */
-const VERSION = "1.0.0";
-const BUILD = "a2cce5b";        // rewritten on publish; "dev" means a local checkout
+const VERSION = "1.1.0";
+const BUILD = "a473ded";        // rewritten on publish; "dev" means a local checkout
 
 const SAMPLE_S = 0.5;        // seconds between samples, in SOURCE time
 const MEDIAN_WINDOW = 5;     // smooth before the clamp, so one spike cannot ratchet
@@ -473,6 +484,12 @@ const RESUME_HOLD = 2;
  * to 30 false alarms, 15s armed 94/97 with none. */
 const MOTION_WARMUP = 15;   // s before stop detection arms — also lets AE settle
 const NOISE_WARMUP = 3;     // s of that spent learning the sensor's noise floor
+/* The tow join. Reset means a new scrap bobbin is on; the new tow is then
+ * joined to the tail of the old one with the machine deliberately still, and
+ * when that is done it starts turning by itself. Operator-set because the
+ * consequence of it being too short is a false "machine stopped" on a join
+ * that ran long, and crying wolf on this channel is how A1 gets ignored. */
+const JOIN_WINDOW = { min: 15, max: 300, def: 60 };
 const MOTION_STEP = 4;      // whole-frame subsample the mask is selected from
 const HOT_FRAC = 0.25;      // beat the floor this often in warm-up to join the mask
 const MIN_MASK = 50;        // fewer sampled pixels than this and the count is noise
@@ -530,23 +547,33 @@ let stopAt;                         // undefined = not decided yet, null = not a
 const clampNum = (v, r) => Math.max(r.min, Math.min(r.max, v || r.def));
 let depEvery = clampNum(+store.get("depEvery", DEP_EVERY.def), DEP_EVERY);
 let stopEvery = clampNum(+store.get("stopEvery", STOP_EVERY.def), STOP_EVERY);
+let joinWindow = clampNum(+store.get("joinWindow", JOIN_WINDOW.def), JOIN_WINDOW);
 /* Off unless asked for. The screen, the beeps and the spoken announcement all
    still fire -- this governs only the POST that leaves the building. Default on
    would mean a phone buzzing through every test and recalibration, and an alert
    people learn to ignore is worse than one they never had. */
 let pushOn = store.get("pushOn", false);
 let faultOn = store.get("faultOn", true);
+let autoExportOn = store.get("autoExportOn", true);
 let sayOn = store.get("sayOn", true);
 let sayEvery = { low: clampNum(+store.get("sayLow", SAY_EVERY.low.def), SAY_EVERY.low),
                  stopped: clampNum(+store.get("sayStop", SAY_EVERY.stopped.def), SAY_EVERY.stopped) };
 let sayTimer = null;
 let noiseFloor = null, noiseSamples = [], prevFull = null;
 let log = null, shiftNo = +(store.get("shiftNo", 0)) || 0;
+let pendingOpenShift = null;        // a shift the app was interrupted in the middle of
 let machineMoving = false;        // the recorded state, not the alert state
 let prevMotion = null, hotCount = null, warmSamples = 0, warmFrames = [];
+/* joinUntil: the performance clock reading at which the join window closes, or
+   null when no join is running. joinWaiting: the window has closed and the mask
+   is being learned on what should now be a turning bobbin -- it is what turns a
+   refusal to arm into "the machine never started". joinAlarmed stops that alarm
+   firing again on each retry. */
+let joinUntil = null, joinWaiting = false, joinAlarmed = false;
 let motionMask = null, maskBuf = null, prevMaskBuf = null;
 let motionOutside = null, outBuf = null, prevOutBuf = null;   // the frame around the mask
 let attendedSince = null, attendTimer = null, attendTicker = null, alertHoldUntil = 0;
+let hiddenSince = null;             // set while the page is in the background
 
 /* ---- setup restore ---------------------------------------------------- */
 $("topic").value = store.get("topic", null) ?? DEFAULT_TOPIC;
@@ -938,14 +965,17 @@ $("reset").onclick = () => {
   log?.add(Shift.EV.RUN_RESET, { peakPct: +clamped.toFixed(1) });
   machineMoving = false;
   resetRun();
+  openJoin();
   $("runNote").className = "note";
-  $("runNote").textContent = "reset";
+  $("runNote").textContent =
+    `reset — stop detection waits ${joinWindow}s for the tow join, then expects the bobbin to turn`;
   paintTally();           // this press starts the next bobbin; show it at once
   if (cal && source) reseedBaseline();
 };
 
 function resetRun() {
   clearRepeats(); clearFault();
+  closeJoin("reset");
   /* runStartedAt is the warm-up clock, not a record of when the session began,
      and clearing the warm-up state without restarting it is the same as
      deleting it: `age` stays minutes past MOTION_WARMUP, both learning phases
@@ -966,6 +996,31 @@ function resetRun() {
   $("pct").textContent = "—"; $("fill").style.width = "0"; $("fill").className = "";
   $("mState").textContent = running ? "monitoring" : "idle";
   octx.clearRect(0, 0, ov.width, ov.height);
+}
+
+/* The tow join window. Learning the motion mask through it would learn it from
+   a stopped machine: fewer than MIN_MASK pixels move, arming refuses, and stop
+   detection is then off for the whole of the next bobbin -- the same
+   end state as the Reset bug of c85b61c, reached through a different door. So
+   the learning phase is held until the window closes. Phase 1 still runs: a
+   still machine is the ideal place to measure the noise floor that a moving one
+   has to be told apart from. */
+function openJoin() {
+  /* Only when stop detection is on. checkStopped is what closes the window on
+     a mask forming, and it is not called at all with faultOn off -- so a window
+     opened then could only ever be closed by the next Reset or by End, which
+     would report the whole bobbin as a join the machine never came back from.
+     No detector, no knowledge: the join goes unmeasured instead of mismeasured. */
+  if (!running || !faultOn) return;
+  joinUntil = performance.now() / 1000 + joinWindow;
+  joinWaiting = false; joinAlarmed = false;
+  log?.add(Shift.EV.JOIN_STARTED);
+}
+
+function closeJoin(by) {
+  if (joinUntil === null && !joinWaiting) return;
+  joinUntil = null; joinWaiting = false; joinAlarmed = false;
+  log?.add(Shift.EV.JOIN_ENDED, { by });
 }
 
 /* % the current frame may already read before we refuse to treat it as a full
@@ -1047,11 +1102,32 @@ async function startRun({ resume = false } = {}) {
   running = true;
   /* Start opens the shift; End closes it. Switching source or releasing the
      camera also stops the run, but neither of those is the operator saying the
-     shift is over, so only the button ends it. Nothing is persisted mid-shift;
-     see §10 of docs/shift-tracking.md for why that is deliberate for now. */
-  if (!log) {
+     shift is over, so only the button ends it. */
+  if (!log && pendingOpenShift) {
+    /* Carrying on a shift the app was interrupted in the middle of. It is
+       adopted here rather than at load, because the one button is Start while
+       log is null and End once it is set -- restoring the log on load would
+       offer the operator no way back in. No second shift.started, no shiftNo
+       increment, and no carried.over: all three are already in these events,
+       and adding them again would double the carry. machineMoving stays false,
+       because a pause records the stop on its way out and nothing the camera
+       has seen since is evidence either way. */
+    log = Shift.createLog(pendingOpenShift.shiftNo,
+                          { initial: pendingOpenShift.events, onAdd: saveOpenShift });
+    clamped = typeof pendingOpenShift.clamped === "number" ? pendingOpenShift.clamped : 0;
+    machineMoving = false;
+    /* If the page was discarded while hidden, nothing recorded the return --
+       hiddenSince went with it. Close the pause here, at the moment we know the
+       operator is back, or it runs to the horizon and charges the rest of the
+       shift to the time the app was away. */
+    const hiddenAt = Shift.openPauseAt(pendingOpenShift.events);
+    if (hiddenAt !== null)
+      log.add(Shift.EV.APP_RESUMED,
+              { hiddenFor: Math.round((Date.now() - hiddenAt) / 1000), by: "restored" });
+    pendingOpenShift = null;
+  } else if (!log) {
     shiftNo += 1; store.set("shiftNo", shiftNo);
-    log = Shift.createLog(shiftNo);
+    log = Shift.createLog(shiftNo, { onAdd: saveOpenShift });
     log.add(Shift.EV.SHIFT_STARTED, { shiftNo, name: $("tShift").value.trim() || "Arvo" });
     machineMoving = false;
     if (pendingCarry) log.add(Shift.EV.CARRIED_OVER, pendingCarry);
@@ -1074,6 +1150,7 @@ async function startRun({ resume = false } = {}) {
 function stopRun() {
   running = false;
   clearRepeats(); clearFault();
+  closeJoin("stopped");   // a no-op when endShift already closed it
   cancelAnimationFrame(rafId);
   updateStart();
   wakeLock?.release?.().catch(() => {}); wakeLock = null;
@@ -1184,6 +1261,28 @@ function checkStopped(img, grid) {
     noiseFloor = srt.length ? srt[srt.length >> 1] : 8;
   }
 
+  /* The tow join: hold the learning phase while the machine is deliberately
+     still. Pinning the clock NOISE_WARMUP back leaves phase 1 complete and
+     phase 2 at zero, so when the window closes the mask gets the full span it
+     is calibrated for (MOTION_WARMUP - NOISE_WARMUP) on a bobbin that should by
+     then be turning. Nothing below this point runs, which is also what keeps
+     the stop alarm quiet through the join -- the stillness is expected. */
+  if (joinUntil !== null) {
+    const left = joinUntil - performance.now() / 1000;
+    if (left > 0) {
+      runStartedAt = performance.now() / 1000 - NOISE_WARMUP;
+      prevMotion = motion; prevFull = full; prevGrid = grid;
+      $("mMotion").textContent = `tow join · stop detection waits ${Math.ceil(left)}s`;
+      $("mMotion").style.color = "";
+      $("mState").textContent = "joining tow";
+      return;
+    }
+    /* The window is up. The bobbin should be turning by itself now, so whether
+       a mask forms over the next few seconds is the answer to "did it start?" */
+    joinUntil = null;
+    joinWaiting = true;
+  }
+
   /* Phase 2: learn WHICH pixels move and HOW MUCH they move while running.
      Both are per-device and per-framing, so neither can be a constant. The
      frames are kept because the running level can only be measured once the
@@ -1264,6 +1363,37 @@ function checkStopped(img, grid) {
         : `Stop detection armed: ${motionMask.length} moving points, running at ` +
           `${level.toFixed(1)}%, noise floor ${noiseFloor.toFixed(0)}, ` +
           `reports stopped below ${stopAt.toFixed(1)}%.`;
+      /* A mask formed, so something was moving: the tow join came good and the
+         bobbin is turning. If the alarm had already gone off for a join that
+         looked dead, leave faultFired set -- the ordinary self-clear below sees
+         RESUME_HOLD of motion and withdraws it, which is the same path a real
+         stop takes and needs no special case here. */
+      if (stopAt !== null && joinWaiting) closeJoin("motion");
+    } else if (joinWaiting) {
+      /* The join window is up and still nothing is moving. The bobbin starts
+         turning by itself once the tow is joined, so this is the machine not
+         starting -- the one case where a refusal to arm is a diagnosis about
+         the MACHINE rather than about the camera. Raise the stop alarm.
+
+         Then keep looking, rather than giving up as the branch below does. A
+         join that ran long is the likeliest cause, and the operator has been
+         told; if the bobbin starts a minute late the next attempt arms, and the
+         ordinary self-clear withdraws the alarm on RESUME_HOLD of motion. One
+         alarm per join, however many attempts it takes. */
+      if (!joinAlarmed) {
+        joinAlarmed = true;
+        faultFired = true; stoppedSince = Date.now();
+        fireFault();
+        $("faultNote").className = "note warn";
+        $("faultNote").textContent =
+          `Bobbin not turning ${joinWindow}s after Reset — the tow join should be done by now. ` +
+          `Still watching: if it starts, this clears itself.`;
+      }
+      /* Another go at phase 2, noise floor kept -- it was measured on a still
+         machine during the join, which is where it is most reliable. */
+      stopAt = undefined;
+      hotCount = null; warmSamples = 0; warmFrames = [];
+      runStartedAt = performance.now() / 1000 - NOISE_WARMUP;
     } else {
       /* Too few moving points is its own diagnosis, and a different one from
          "nothing moved": it means the camera can see the machine but nothing
@@ -1290,8 +1420,13 @@ function checkStopped(img, grid) {
   prevMotion = motion; prevFull = full; prevGrid = grid;
   if (m === null) {
     if (!motionMask) {
-      $("mMotion").textContent = "stop detection off — no moving points";
-      $("mMotion").style.color = "";
+      /* Mid-join the same state means something different: the detector is
+         still trying, not switched off. Saying "off" there would read as the
+         app having given up at the exact moment it is watching hardest. */
+      $("mMotion").textContent = joinWaiting
+        ? "bobbin still not turning — looking again"
+        : "stop detection off — no moving points";
+      $("mMotion").style.color = joinWaiting ? "var(--amber)" : "";
     }
     return;
   }
@@ -1526,6 +1661,10 @@ $("depEvery").oninput = () => {
   depEvery = clampNum(+$("depEvery").value, DEP_EVERY);
   store.set("depEvery", depEvery); paintIntervals();
 };
+$("joinWindow").oninput = () => {
+  joinWindow = clampNum(+$("joinWindow").value, JOIN_WINDOW);
+  store.set("joinWindow", joinWindow); paintIntervals();
+};
 $("stopEvery").oninput = () => {
   stopEvery = clampNum(+$("stopEvery").value, STOP_EVERY);
   store.set("stopEvery", stopEvery); paintIntervals();
@@ -1560,6 +1699,7 @@ $("sayStop").oninput = () => {
 function paintIntervals() {
   $("depEvery").value = depEvery;
   $("stopEvery").value = stopEvery;
+  $("joinWindow").value = joinWindow;
 }
 paintIntervals();
 
@@ -1584,6 +1724,10 @@ $("faultBtn").onclick = () => {
   paintFault();
   if (!faultOn) {
     clearFault(); faultFired = false;
+    /* Switching the detector off mid-join closes the window: nothing is left
+       that could close it on motion, so leaving it open would charge the rest
+       of the bobbin to a join that was simply no longer being watched. */
+    closeJoin("stopped");
     $("faultNote").textContent = ""; $("mMotion").textContent = "";
     if (alertKind === "stopped") hideAlertScreen();
   }
@@ -1725,9 +1869,77 @@ function acknowledge() {
 $("alertAck").onclick = acknowledge;
 $("alertAttend").onclick = () => { if (alertKind) acknowledge(); startIntervention(); };
 
+/* ---- the app in the background -----------------------------------------
+   The tablet gets borrowed for other companies' work, which means minimizing
+   Chrome. Note what is NOT the problem: the loop runs on requestAnimationFrame,
+   which the browser stops on a hidden page, so monitoring has already halted by
+   the time anything here runs. What we lose by not noticing is the RECORD. With
+   no stop event, motionIntervals reads the whole absence as one unbroken running
+   span, and on return the first frame compared against one from an hour ago
+   reads as motion everywhere, so the span never closes. An hour on someone
+   else's job is then reported as an hour of production. Recording the pair is
+   what makes the gap honest.
+
+   This is deliberately not shaped like Operator intervention, which stays
+   exactly as it was: no five-minute timeout to expire while we are away, no
+   acknowledging a live alert, and its own figure rather than attendedSeconds,
+   which means time spent at the machine.
+
+   Written inside the handler rather than from a timer because this is the last
+   moment the page is reliably allowed to run: once hidden, Android throttles
+   timers and may freeze the tab outright. Brief hides -- a pulled-down
+   notification shade -- are recorded too. The log keeps what happened; deciding
+   what it means is the derivation's job, not this function's. */
+function pauseForHidden() {
+  if (!running || !log || hiddenSince !== null) return;
+  hiddenSince = Date.now();
+  log.add(Shift.EV.APP_PAUSED);
+  /* The same reasoning as startIntervention, for the same reason. If the
+     detector still thinks the machine is running, nothing observed after this
+     moment can say when it stopped -- so the stop is recorded now. `by` carries
+     why, which is what keeps it out of faultStops. */
+  if (machineMoving) {
+    machineMoving = false;
+    log.add(Shift.EV.MOTION_STOPPED,
+            { pct: +clamped.toFixed(1), outside: null, by: "paused" });
+  }
+  movingFor = 0; quietFor = 0;
+}
+
+function resumeFromHidden() {
+  if (hiddenSince === null) return;
+  const lasted = Math.round((Date.now() - hiddenSince) / 1000);
+  hiddenSince = null;
+  log?.add(Shift.EV.APP_RESUMED, { hiddenFor: lasted });
+  /* Every previous-frame reference is from before the gap. Comparing the first
+     frame back against one from an hour ago reads as motion across the whole
+     grid, which would both fake a restart and bury the stop recorded on the way
+     out. Dropping them costs one sample and makes the next comparison a real
+     one. The noise floor and the learned mask are kept on purpose: they
+     describe the sensor and the view, and neither changed while we were away --
+     see the note on keepFloor in startRun for what re-measuring a floor over a
+     moving machine does. */
+  prevMotion = null; prevFull = null; prevGrid = null;
+  movingFor = 0; quietFor = 0;
+  /* Hidden before stop detection finished arming is the failure resetRun warns
+     about, arriving by a different route: `age` is now minutes past
+     MOTION_WARMUP while warmSamples holds almost nothing, so the mask would be
+     built from a handful of frames and never rebuilt for the rest of the
+     session. Restart the learning phase instead of letting it lapse. */
+  if (stopAt === undefined) {
+    runStartedAt = performance.now() / 1000;
+    hotCount = null; warmSamples = 0; warmFrames = [];
+  }
+  $("runNote").className = "note warn";
+  $("runNote").textContent =
+    `Paused ${mmss(lasted)} while the app was in the background. That time is recorded as idle, `
+    + `not as running, and not as a machine fault. Watching the machine again.`;
+}
+
 document.addEventListener("visibilitychange", () => {
-  if (running && document.visibilityState === "visible")
-    navigator.wakeLock?.request("screen").then(w => wakeLock = w).catch(() => {});
+  if (document.visibilityState === "hidden") { pauseForHidden(); return; }
+  resumeFromHidden();
+  if (running) navigator.wakeLock?.request("screen").then(w => wakeLock = w).catch(() => {});
 });
 
 /* ---- shift counters, completion and export ------------------------------ */
@@ -1836,6 +2048,48 @@ function savedShifts() {
   return Array.isArray(v) ? v : [];
 }
 
+/* ---- a shift the app was interrupted in the middle of --------------------
+   §10 deferred surviving a reload, on the grounds that it would cost a session
+   only now and then and the cost was one shift's data. The background pause of
+   §6.7 made that judgement wrong: a long minimize is exactly when Android
+   discards the page, so the log -- which lived only in memory -- would be lost
+   on precisely the absences the pause exists to record.
+
+   Written on every event, through createLog's onAdd hook. One save site rather
+   than a call beside each log.add, because a forgotten one reopens the hole
+   silently and the symptom appears days later as a missing shift. A shift runs
+   to a few hundred events, so this is a few hundred small writes across a day.
+   store.set already swallows a quota failure (see the note on `store`), so a
+   full disk cannot take the run down with it. */
+const OPEN_KEY = "openShift";
+const OPEN_MAX_H = 16;              // past one working stretch it is abandoned, not interrupted
+
+function saveOpenShift() {
+  if (!log) return;
+  store.set(OPEN_KEY, { shiftNo: log.shiftNo, events: log.events,
+                        clamped, savedAt: Date.now() });
+}
+
+function restoreOpenShift() {
+  const open = store.get(OPEN_KEY, null);
+  if (!open || !Array.isArray(open.events) || !open.events.length) return;
+  if ((Date.now() - (open.savedAt || 0)) / 3600000 > OPEN_MAX_H) {
+    store.set(OPEN_KEY, null);
+    return;
+  }
+  pendingOpenShift = open;
+  const { shift } = Shift.derive(open.events, { now: Date.now() });
+  $("sessionNote").className = "note warn";
+  $("sessionNote").textContent =
+    `Shift "${shift.name ?? "Arvo"}" is still open — ${open.events.length} events recorded, `
+    + `${mmss(shift.totalIdleSeconds)} idle so far. Press Start to carry on with it; `
+    + `it becomes End once you do.`;
+}
+/* Wrapped, because this is a load-time read of data written by an older build.
+   A throw here would take the whole page down before the operator could so much
+   as pick a camera, and losing one interrupted shift is the lesser failure. */
+try { restoreOpenShift(); } catch { store.set(OPEN_KEY, null); }
+
 /* A finished bobbin is counted where it happens and changes nothing else. The
    rewinder reaching weight has no bearing on the scrap bobbin feeding it, which
    usually still has tow on it and carries straight on. */
@@ -1916,25 +2170,52 @@ $("attendBtn").onclick = () =>
 function endShift() {
   if (log) {
     endIntervention("end");
+    closeJoin("end");       // before shift.ended, so the window lands inside the shift
     log.add(Shift.EV.SHIFT_ENDED, { peakPct: +clamped.toFixed(1) });
     const { shift } = log.derive({ now: Date.now() });
     /* Keep the events, not just the summary. The rules that turn one into the
        other are new and will be revised; a summary cannot be recomputed. */
-    const kept = [...savedShifts(), { events: log.events, summary: shift }].slice(-SHIFT_KEEP);
+    const record = { events: log.events, summary: shift };
+    const kept = [...savedShifts(), record].slice(-SHIFT_KEEP);
     store.set("shifts", kept);
+    store.set(OPEN_KEY, null);          // filed, so no longer interrupted
+    /* Write the files only once the shift is safely stored, so a download that
+       fails cannot cost us the record. This runs inside the End press, which is
+       what allows a download at all -- Chrome refuses one outside a gesture.
+       Only the shift that just ended goes out, so each day leaves one clean set
+       of files; Export data is still there for the whole kept history. */
+    let wrote = 0, writeFailed = false;
+    if (autoExportOn) {
+      try { wrote = writeFiles([record], `${Shift.fileSlug(shift.name)}-${fileStamp()}`); }
+      catch { writeFailed = true; }
+    }
     log = null; machineMoving = false;
     pendingCarry = null; store.set("carry", null);
     $("bobbinDone").disabled = true;
-    $("sessionNote").className = "note ok";
+    $("sessionNote").className = "note " + (writeFailed ? "warn" : "ok");
     $("sessionNote").textContent =
       `Shift "${shift.name}" ended — ${shift.bobbinsCompleted} bobbin${shift.bobbinsCompleted === 1 ? "" : "s"} ` +
       `completed, ${shift.scrapBobbins} scrap bobbins used, ${mmss(shift.totalRunSeconds)} running, ` +
       `${mmss(shift.idleDuringBobbinBuildSeconds)} idle` +
-      (shift.idleAfterBobbinCompleteSeconds > 0 ? `, ${mmss(shift.idleAfterBobbinCompleteSeconds)} between bobbins.` : ".");
+      (shift.idleAfterBobbinCompleteSeconds > 0 ? `, ${mmss(shift.idleAfterBobbinCompleteSeconds)} between bobbins.` : ".") +
+      (writeFailed ? " The shift is saved on the tablet, but its files could not be written — press Export data."
+       : wrote ? ` ${wrote} file${wrote === 1 ? "" : "s"} saved to Downloads.` : "");
   }
   stopRun();
   updateStart();
   paintTally();
+}
+
+/* Shift.exportFiles decides which files there are and what is in them; this
+   only hands each one to the browser. Returns how many were written. */
+function writeFiles(bundle, stamp) {
+  const files = Shift.exportFiles(bundle, stamp, { now: Date.now() });
+  for (const f of files) download(f.name, f.text, f.type);
+  return files.length;
+}
+
+function fileStamp() {
+  return new Date().toISOString().slice(0, 16).replace(/[:T]/g, "-");
 }
 
 $("exportBtn").onclick = () => {
@@ -1946,17 +2227,23 @@ $("exportBtn").onclick = () => {
     $("sessionNote").textContent = "Nothing recorded yet.";
     return;
   }
-  const derived = bundle.map(b => Shift.derive(b.events, { now: Date.now() }));
-  const rows = derived.flatMap(d => Shift.toCSV(d.runs, d.shift).split("\n").slice(1));
-  const bRows = derived.flatMap(d => Shift.bobbinsCSV(d.bobbins, d.shift).split("\n").slice(1));
-  const header = Shift.toCSV([], null).split("\n")[0];
-  const bHeader = Shift.bobbinsCSV([], null).split("\n")[0];
-  const stamp = new Date().toISOString().slice(0, 16).replace(/[:T]/g, "-");
-  download(`tow-scrap-bobbins-${stamp}.csv`, [header, ...rows].join("\n"), "text/csv");
-  if (bRows.length) download(`tow-bobbins-${stamp}.csv`, [bHeader, ...bRows].join("\n"), "text/csv");
-  download(`tow-shifts-${stamp}.json`, JSON.stringify(bundle, null, 1), "application/json");
+  writeFiles(bundle, fileStamp());
   $("sessionNote").className = "note ok";
   $("sessionNote").textContent = `Exported ${bundle.length} shift${bundle.length > 1 ? "s" : ""}.`;
+};
+
+function paintAutoExport() {
+  $("autoExportBtn").textContent = autoExportOn ? "Auto export: ON" : "Auto export: OFF";
+  $("autoExportBtn").classList.toggle("seg", true);
+  $("autoExportBtn").classList.toggle("on", autoExportOn);
+}
+paintAutoExport();
+$("autoExportBtn").onclick = () => {
+  autoExportOn = !autoExportOn; store.set("autoExportOn", autoExportOn); paintAutoExport();
+  $("sessionNote").className = "note" + (autoExportOn ? "" : " warn");
+  $("sessionNote").textContent = autoExportOn
+    ? "Ending a shift will save that shift's files to Downloads."
+    : "Ending a shift saves it on the tablet only — press Export data for the files.";
 };
 
 function download(name, text, type) {

@@ -36,6 +36,10 @@ const EV = {
   CARRIED_OVER:           "carried.over",          // { bobbinsCompleted, scrapBobbins, idleSeconds }
   INTERVENTION_STARTED:   "intervention.started",  // operator at the machine, door open
   INTERVENTION_ENDED:     "intervention.ended",    // { by: "button" | "reset" | "timeout" | "end" }
+  APP_PAUSED:             "app.paused",            // the page went to the background
+  APP_RESUMED:            "app.resumed",           // { hiddenFor } seconds it was away
+  JOIN_STARTED:           "join.started",          // Reset: the tow is being joined
+  JOIN_ENDED:             "join.ended",            // { by: "motion" | "reset" | "end" | "stopped" }
 };
 
 /* A run that ended with no alert is either one we failed to warn about or one
@@ -72,11 +76,13 @@ function motionIntervals(events, endT) {
   for (const e of events) {
     if (e.type === EV.MOTION_STARTED && open === null) open = e.t;
     else if (e.type === EV.MOTION_STOPPED && open !== null) {
-      out.push({ start: open, end: e.t, stopPct: typeof e.pct === "number" ? e.pct : null });
+      out.push({ start: open, end: e.t, stopPct: typeof e.pct === "number" ? e.pct : null,
+                 stopBy: e.by ?? null });
       open = null;
     }
   }
-  if (open !== null) out.push({ start: open, end: endT, openEnded: true, stopPct: null });
+  if (open !== null)
+    out.push({ start: open, end: endT, openEnded: true, stopPct: null, stopBy: null });
   return out;
 }
 
@@ -116,7 +122,7 @@ function subtract(intervals, windows) {
     const next = [];
     for (const i of out) {
       if (w.end <= i.start || w.start >= i.end) { next.push(i); continue; }
-      if (w.start > i.start) next.push({ ...i, end: w.start, stopPct: null });
+      if (w.start > i.start) next.push({ ...i, end: w.start, stopPct: null, stopBy: null });
       if (w.end < i.end) next.push({ ...i, start: w.end });
     }
     out = next;
@@ -192,6 +198,41 @@ function derive(events, { now = null, missAbovePct = MISS_ABOVE_PCT } = {}) {
   if (openI) attended.push({ start: openI.t, end: horizon, by: null, open: true });
   const attendedIn = (from, to) => within(attended, from, to);
 
+  /* The app in the background: the tablet was taken away for other work, so the
+     camera saw nothing. Measured from the event pair rather than inferred from
+     the motion log, because a minimize that happened while the machine was
+     already stopped records no stop and would otherwise be invisible. A window
+     left open is one the shift never came back from. */
+  const hidden = [];
+  let openH = null;
+  for (const e of ev) {
+    if (e.type === EV.APP_PAUSED && !openH) openH = e;
+    else if (e.type === EV.APP_RESUMED && openH) {
+      hidden.push({ start: openH.t, end: e.t });
+      openH = null;
+    }
+  }
+  if (openH) hidden.push({ start: openH.t, end: horizon, open: true });
+  const hiddenIn = (from, to) => within(hidden, from, to);
+
+  /* The tow join. Reset means a new scrap bobbin is on, and the new tow then
+     has to be joined to the tail of the old one -- about a minute, with the
+     machine deliberately still, after which it starts turning by itself. The
+     window is recorded so the stillness can be told apart from a machine that
+     stopped on its own: the same silence, opposite meanings. How it closed is
+     kept on the JOIN_ENDED event. */
+  const joins = [];
+  let openJ = null;
+  for (const e of ev) {
+    if (e.type === EV.JOIN_STARTED && !openJ) openJ = e;
+    else if (e.type === EV.JOIN_ENDED && openJ) {
+      joins.push({ start: openJ.t, end: e.t, by: e.by ?? null });
+      openJ = null;
+    }
+  }
+  if (openJ) joins.push({ start: openJ.t, end: horizon, by: null, open: true });
+  const joinIn = (from, to) => within(joins, from, to);
+
   const idle = [];            // every stopped period counted as idle during a build
   const runs = [];
   let openAt = (ev.find(e => e.type === EV.RUN_STARTED) || { t: startedAt }).t;
@@ -201,7 +242,8 @@ function derive(events, { now = null, missAbovePct = MISS_ABOVE_PCT } = {}) {
     const mine = ev.filter(e => e.t >= from && e.t <= to);
     const spans = running.map(i => {
       const o = overlap(i, from, to);
-      return o ? { ...o, stopPct: o.end === i.end ? i.stopPct : null } : null;
+      return o ? { ...o, stopPct: o.end === i.end ? i.stopPct : null,
+                         stopBy: o.end === i.end ? i.stopBy : null } : null;
     }).filter(Boolean);
     const alert = mine.find(e => e.type === EV.DEPLETION_ALERTED);
     const ack = mine.find(e => e.type === EV.DEPLETION_ACKNOWLEDGED);
@@ -216,9 +258,56 @@ function derive(events, { now = null, missAbovePct = MISS_ABOVE_PCT } = {}) {
        carried on to 99% -- which is a pause, not a fault, and is counted apart
        so the fault figure stays a measure of the machine. */
     const stops = [];
+
+    /* THE TOW JOIN. Reset means a new scrap bobbin is on, and the new tow then
+       has to be joined to the tail of the old one -- about a minute, machine
+       deliberately still, after which it starts turning by itself. That minute
+       was being thrown away: idle below is built from the gaps BETWEEN motion
+       spans, and this one sits before the first span, with nothing in front of
+       it to close. Measured on a 410 s fixture with one join, 72 s went
+       unaccounted for and utilisation read 94.1% where the truth was 79.5%.
+
+       Only a gap a join window explains is claimed. The same gap after Start
+       means something else entirely: the detector needs MOTION_WARMUP to learn
+       its mask before it can report motion at all, so the first motion.started
+       of a shift arrives about 13 s after the press however long the machine
+       has been turning. Those seconds are unobserved, not idle, and booking
+       them as idle would charge the operator for the warm-up. A join window is
+       the one case where the stillness is known rather than inferred -- the
+       operator pressed Reset and is standing there joining the tow.
+
+       Runs with no motion at all are also left alone. Their nominal range is
+       degenerate (`boundary` takes closeAt from the last motion ANYWHERE before
+       the closer, which lands before such a run even opened, so `to` precedes
+       `from`) and they already mis-add: two Resets with nothing moving between
+       them overlap their swap windows and double-count the gap, 8 s on a 210 s
+       fixture. Claiming the lead gap on top of that made it worse, not better
+       (-8 s to -20 s). That is a separate known fault, left as it was. Such a
+       join is still reported through towJoinSeconds, which is measured from the
+       event pair and does not depend on this arithmetic. */
+    const joinStarted = mine.find(e => e.type === EV.JOIN_STARTED);
+    let joinSeconds = null;
+    const firstMotion = spans.length ? spans[0].start : null;
+    if (joinStarted && firstMotion !== null && firstMotion > from) {
+      const w = { start: from, end: firstMotion };
+      const seconds = secs(net(w.start, w.end));
+      if (seconds > 0) {
+        stops.push({ ...w, kind: "join", seconds, exposurePct: null });
+        idle.push({ ...w, kind: "join" });
+        joinSeconds = seconds;
+      }
+    }
+
     for (let i = 0; i < spans.length - 1; i++) {
       const g = { start: spans[i].end, end: spans[i + 1].start };
-      const kind = alert && g.start >= alert.t ? "pause" : "fault";
+      /* A stop recorded because the app went to the background is not the
+         machine failing -- the tablet was being used for something else. This
+         is the away-stop fix of 8332fc6 applied to the one case that survived
+         it: a figure meant to measure the machine must not count a stop the
+         operator caused by taking the tablet away. The seconds are still idle;
+         only the blame changes. */
+      const kind = spans[i].stopBy === "paused" ? "paused"
+                 : alert && g.start >= alert.t ? "pause" : "fault";
       stops.push({ ...g, kind, seconds: secs(net(g.start, g.end)), exposurePct: spans[i].stopPct });
       idle.push({ ...g, kind });
     }
@@ -258,6 +347,9 @@ function derive(events, { now = null, missAbovePct = MISS_ABOVE_PCT } = {}) {
       faultStopSeconds: total(of("fault")),
       depletionPauses: of("pause").length,
       depletionPauseSeconds: total(of("pause")),
+      pausedStops: of("paused").length,
+      pausedStopSeconds: total(of("paused")),
+      joinSeconds,
       swapSeconds,
       stops,
       open: !closer,
@@ -296,6 +388,8 @@ function derive(events, { now = null, missAbovePct = MISS_ABOVE_PCT } = {}) {
       // whichever side of the previous completion it fell
       totalIdleSeconds: secs(idleMs + afterIn(from, to)),
       attendedSeconds: secs(attendedIn(from, to)),
+      appPausedSeconds: secs(hiddenIn(from, to)),
+      towJoinSeconds: secs(joinIn(from, to)),
       // a scrap bobbin counts against whichever bobbin it was used up feeding
       scrapBobbins: runs.filter(r => !r.open && r.endedAt > from && r.endedAt <= to).length,
       utilisation: run + idleMs > 0 ? Math.round((1000 * run) / (run + idleMs)) / 10 : null,
@@ -399,6 +493,18 @@ function derive(events, { now = null, missAbovePct = MISS_ABOVE_PCT } = {}) {
       currentBobbinFrozen,
       lastBobbinIdleSeconds: bobbins.length ? bobbins[bobbins.length - 1].totalIdleSeconds : null,
       attendedSeconds: secs(attendedIn(startedAt, horizon)),
+      appPausedSeconds: secs(hiddenIn(startedAt, horizon)),
+      appPauses: hidden.length,
+      /* What joining the tow cost across the shift, and how many of those joins
+         the machine never started itself after. Only "motion" means the mask
+         formed, which is the one proof available that the bobbin turned; a join
+         closed by the next Reset, by the shift ending or by the camera going
+         away is one the operator had to deal with, and is what they were
+         alarmed about. An open window counts the same way -- it never came
+         good either. */
+      towJoinSeconds: secs(joinIn(startedAt, horizon)),
+      towJoins: joins.length,
+      towJoinsWithoutMotion: joins.filter(w => w.by !== "motion").length,
       interventions: attended.length,
       interventionsTimedOut: attended.filter(w => w.by === "timeout").length,
       missedAlerts: runs.filter(r => r.endedBy === "missed").length,
@@ -414,39 +520,92 @@ function derive(events, { now = null, missAbovePct = MISS_ABOVE_PCT } = {}) {
 function toCSV(runs, shift) {
   const cols = ["shift", "shiftName", "bobbin", "runSeconds", "swapSeconds", "peakPct",
                 "warningSeconds", "ackSeconds", "endedBy", "faultStops", "faultStopSeconds",
-                "depletionPauses", "depletionPauseSeconds", "stopsAt"];
+                "depletionPauses", "depletionPauseSeconds",
+                "pausedStops", "pausedStopSeconds", "joinSeconds", "stopsAt"];
   // "fault 12.0 / pause 40.1 / swap 99.2" -- no commas, so it survives as one cell
-  const stopsAt = r => (r.stops || []).filter(x => x.kind !== "current")
+  const stopsAt = r => (r.stops || [])
+    .filter(x => x.kind !== "current" && x.kind !== "join" && x.kind !== "startup")
     .map(x => `${x.kind} ${x.exposurePct ?? "?"}`).join(" / ");
   const rows = runs.map(r => [
     shift ? shift.shiftNo : "", shift ? (shift.name ?? "") : "",
     r.seq, r.runSeconds, r.swapSeconds ?? "",
     r.peakPct ?? "", r.warningSeconds ?? "", r.ackSeconds ?? "", r.endedBy,
-    r.faultStops, r.faultStopSeconds, r.depletionPauses, r.depletionPauseSeconds, stopsAt(r)]);
+    r.faultStops, r.faultStopSeconds, r.depletionPauses, r.depletionPauseSeconds,
+    r.pausedStops, r.pausedStopSeconds, r.joinSeconds ?? "", stopsAt(r)]);
   return [cols.join(","), ...rows.map(r => r.join(","))].join("\n");
 }
 
 function bobbinsCSV(bobbins, shift) {
   const cols = ["shift", "shiftName", "completedBobbin", "elapsedSeconds", "runSeconds",
                 "idleDuringBobbinBuildSeconds", "idleAfterBobbinCompleteSeconds",
-                "totalIdleSeconds", "attendedSeconds", "scrapBobbins", "utilisationPct"];
+                "totalIdleSeconds", "attendedSeconds", "appPausedSeconds", "towJoinSeconds",
+                "scrapBobbins", "utilisationPct"];
   const rows = bobbins.map(b => [
     shift ? shift.shiftNo : "", shift ? (shift.name ?? "") : "", b.seq,
     b.elapsedSeconds, b.runSeconds, b.idleDuringBobbinBuildSeconds,
     b.idleAfterBobbinCompleteSeconds, b.totalIdleSeconds, b.attendedSeconds,
-    b.scrapBobbins, b.utilisation ?? ""]);
+    b.appPausedSeconds, b.towJoinSeconds, b.scrapBobbins, b.utilisation ?? ""]);
   return [cols.join(","), ...rows.map(r => r.join(","))].join("\n");
+}
+
+/* An export, as names and contents. The page only has to hand each one to the
+ * browser, which is the part that cannot be tested outside one -- everything
+ * about which files appear, what they are called and what is in them is here.
+ *
+ * Both exports come through this: the button, which takes the whole kept
+ * history, and the end of a shift, which takes only the shift that just ended.
+ * One shift per set of files keeps a day's export clean; the alternative, each
+ * export carrying every shift again, is a pile of files that mostly repeat.
+ *
+ * The per-bobbin file is omitted when no bobbin was finished, rather than being
+ * written with a header and no rows -- an empty file in Downloads reads as a
+ * failed export. */
+function exportFiles(bundle, stamp, { now = null } = {}) {
+  const t = now ?? Date.now();
+  const derived = bundle.map(b => derive(b.events, { now: t }));
+  const rows  = derived.flatMap(d => toCSV(d.runs, d.shift).split("\n").slice(1));
+  const bRows = derived.flatMap(d => bobbinsCSV(d.bobbins, d.shift).split("\n").slice(1));
+  const files = [{
+    name: `tow-scrap-bobbins-${stamp}.csv`, type: "text/csv",
+    text: [toCSV([], null).split("\n")[0], ...rows].join("\n"),
+  }];
+  if (bRows.length) files.push({
+    name: `tow-bobbins-${stamp}.csv`, type: "text/csv",
+    text: [bobbinsCSV([], null).split("\n")[0], ...bRows].join("\n"),
+  });
+  files.push({
+    name: `tow-shifts-${stamp}.json`, type: "application/json",
+    text: JSON.stringify(bundle, null, 1),
+  });
+  return files;
+}
+
+/* A shift is named by the operator, so it reaches a filename through this.
+ * Anything that is not a letter or digit becomes a hyphen, which leaves a name
+ * safe on every filesystem the files might land on. */
+function fileSlug(name) {
+  return (name || "").toLowerCase().replace(/[^a-z0-9]+/g, "-")
+                     .replace(/^-+|-+$/g, "").slice(0, 24) || "shift";
 }
 
 /* A log that records and nothing else. Keeping it this thin is the point: the
  * app appends, the derivation reads, and neither knows about the other. */
-function createLog(shiftNo) {
-  const events = [];
+/* `initial` restores a shift that was interrupted; `onAdd` fires after every
+ * event so the caller can persist the log without having to remember to. The
+ * hook rather than scattered save calls is deliberate: §10 deferred surviving a
+ * reload on the grounds that it would cost a session only occasionally, and the
+ * background pause of §6.7 made that wrong -- a long minimize is exactly when
+ * Android discards the page. One missed save site would reopen the hole, so
+ * there is only one site. A shift runs to a few hundred events, so saving on
+ * each one is a few hundred small writes across a working day. */
+function createLog(shiftNo, { initial = [], onAdd = null } = {}) {
+  const events = [...initial];
   return {
     events,
     add(type, payload = {}, t = Date.now()) {
       const e = { t, type, ...payload };
       events.push(e);
+      if (onAdd) onAdd(e, events);
       return e;
     },
     derive(opts) { return derive(events, opts); },
@@ -454,7 +613,25 @@ function createLog(shiftNo) {
   };
 }
 
-const Shift = { EV, MISS_ABOVE_PCT, derive, toCSV, bobbinsCSV, createLog, motionIntervals };
+/* When a pause was never resumed, its timestamp; otherwise null.
+ *
+ * The page can be DISCARDED while hidden, which takes the in-memory hiddenSince
+ * with it, so nothing is left to record the return. An unclosed pause runs to
+ * the horizon (see the hidden windows in derive), which would charge every hour
+ * of the rest of the shift to time the app was away. Whoever restores the log
+ * closes it at the moment the operator came back, which is the one thing we do
+ * know: they are here, pressing Start. */
+function openPauseAt(events) {
+  let at = null;
+  for (const e of events) {
+    if (e.type === EV.APP_PAUSED) at = e.t;
+    else if (e.type === EV.APP_RESUMED) at = null;
+  }
+  return at;
+}
+
+const Shift = { EV, MISS_ABOVE_PCT, derive, toCSV, bobbinsCSV, createLog, motionIntervals,
+                openPauseAt, exportFiles, fileSlug };
 
 if (typeof module !== "undefined" && module.exports) module.exports = Shift;
 if (typeof window !== "undefined") window.Shift = Shift;
