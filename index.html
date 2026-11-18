@@ -240,6 +240,13 @@
         <button id="calToggle" class="seg">Recalibrate</button>
       </div>
       <div id="calBody">
+        <div class="row">
+          <button id="realignBtn" class="go seg" disabled>Re-align to this view</button>
+          <button id="realignUndo" class="seg hidden">Undo re-align</button>
+        </div>
+        <p class="note" id="realignNote">Tablet knocked? This slides the saved tube region to where
+          the tube is now, from the bobbin in view — no bare tube needed. A camera re-aimed from a
+          new angle or distance needs the two stills below instead.</p>
         <p class="note" id="calHint">Once per camera position, not per run. Two stills:
           a full bobbin, then the bare tube. After the first run the app offers to re-fit
           from the bobbin that just ran down, so no empty tube is needed.</p>
@@ -294,8 +301,13 @@
       </div>
       <p class="note" id="baseNote"></p>
       <p class="note" id="recNote">Records what the detector measured, twice a second, plus a
-        few small stills — not video. Stopping downloads the traces to this tablet. They only
-        change anything once they are applied from the workstation and published back.</p>
+        few small stills. Stopping downloads the traces to this tablet. They only change
+        anything once they are applied from the workstation and published back.</p>
+      <div class="row">
+        <button id="vidBtn">Video with recordings: ON</button>
+      </div>
+      <p class="note" id="vidNote">With video on, a recording also saves the camera exactly as the
+        detector sees it — exposure locked, no overlays — at about 11 MB a minute.</p>
       <p class="note" id="sessionNote"></p>
     </section>
 
@@ -389,8 +401,8 @@ const gctx = grab.getContext("2d", { willReadFrequently: true });
    time at the machine more than once: the service worker is cache-first, so a
    reload can show the old shell while the new one installs behind it. A build
    string settles that in a glance instead of by hunting for a changed word. */
-const VERSION = "1.2.1";
-const BUILD = "4f97622";        // rewritten on publish; "dev" means a local checkout
+const VERSION = "1.3.0";
+const BUILD = "143e422";        // rewritten on publish; "dev" means a local checkout
 
 const SAMPLE_S = 0.5;        // seconds between samples, in SOURCE time
 const MEDIAN_WINDOW = 5;     // smooth before the clamp, so one spike cannot ratchet
@@ -509,8 +521,25 @@ const NOISE_WARMUP = 3;     // s of that spent learning the sensor's noise floor
  * joined to the tail of the old one with the machine deliberately still, and
  * when that is done it starts turning by itself. Operator-set because the
  * consequence of it being too short is a false "machine stopped" on a join
- * that ran long, and crying wolf on this channel is how A1 gets ignored. */
-const JOIN_WINDOW = { min: 15, max: 300, def: 60 };
+ * that ran long, and crying wolf on this channel is how A1 gets ignored.
+ *
+ * 100 s, because that is how long a join takes: Arun's figure from the floor,
+ * 18 Nov. The default was 60.
+ *
+ * The app's own join timings cannot confirm or refute that, and were wrongly
+ * cited as if they did when the default first changed. A join is closed by the
+ * motion mask forming, and the mask cannot begin to form until the window is
+ * over -- checkStopped returns early all through it. So a recorded join is the
+ * window plus the ~12 s phase-2 warm-up, plus 12 s for every refusal. The
+ * 71-74 s measured on 17 Nov are 60 + 12; the 84 s is one refusal more. They
+ * are a reading of this setting, not of the join.
+ *
+ * What a window shorter than the join does is the reason to get it right. The
+ * warm-up then runs on the join's own movement -- the tow shifting, the heater
+ * running along it -- so the mask can arm on that instead of on the bobbin
+ * turning, the rest of the join is booked as production, and stop detection
+ * judges the whole bobbin against a mask fitted to the wrong motion. */
+const JOIN_WINDOW = { min: 15, max: 300, def: 100 };
 const MOTION_STEP = 4;      // whole-frame subsample the mask is selected from
 const HOT_FRAC = 0.25;      // beat the floor this often in warm-up to join the mask
 const MIN_MASK = 50;        // fewer sampled pixels than this and the count is noise
@@ -610,6 +639,7 @@ let pendingOpenShift = null;        // a shift the app was interrupted in the mi
 let restoredGap = null;             // what the last restore charged to being away
 const GAP_MIN_S = 10;               // under this, a reload is not worth a pair of events
 let machineMoving = false;        // the recorded state, not the alert state
+let lastStopAt = null;            // when MOTION_STOPPED was last written; floors the backdate below
 let prevMotion = null, hotCount = null, warmSamples = 0, warmFrames = [];
 let armAttempts = 0;        // arming retries on this run; 0 once it has armed
 
@@ -664,6 +694,14 @@ $("topic").value = store.get("topic", null) ?? DEFAULT_TOPIC;
 if (!store.get("thrV2", false)) { store.set("thr", 5); store.set("thrV2", true); }
 $("thr").value = store.get("thr", 5);
 if (cal && cal.refSmall) refSmall = Float32Array.from(cal.refSmall);
+/* Declared here, ABOVE the first paintCalChip(), and it must stay above it.
+   With a calibration saved, paintCalChip() calls paintCalSection(), which reads
+   calOpen; declared further down, that read was a temporal-dead-zone
+   ReferenceError that killed the whole script at load. No camera button, no
+   version chip -- "live camera is not working, no commit number on top", 17 Nov
+   -- on every reopen after calibrating, and on no fresh install, which is why
+   it hid. See the section fold note below. */
+let calOpen = false;
 paintCalChip();
 paintNetChip();
 if (calStale)
@@ -683,8 +721,8 @@ $("thr").oninput = () => {
    half the panel during every run -- at 1280x800, the tablet's own size, that
    pushed Bobbin complete, Export data, Stop detection and Record run all below
    the fold, where an operator cannot find them. Setup belongs out of the way
-   of the thing the app does all day. */
-let calOpen = false;
+   of the thing the app does all day. `calOpen` is declared above, before the
+   first paintCalChip(). */
 function paintCalSection() {
   const open = calOpen || !cal;
   $("calBody").classList.toggle("hidden", !open);
@@ -883,17 +921,21 @@ $("camLockBtn").onclick = async () => {
   paintCamLock();
 };
 
+// Asking for 1080p or 4K buys nothing: analysis is capped at CV.ANALYSIS_MAX
+// regardless, and the larger stream costs decode time, canvas bandwidth and
+// battery to be thrown away a moment later.
+const CAMERA_CONSTRAINTS = {
+  video: { facingMode: "environment", width: { ideal: CV.ANALYSIS_MAX }, height: { ideal: 720 } },
+  audio: false,
+};
+
 $("srcCam").onclick = async () => {
+  /* A tap, so a recording of the old stream can be saved now rather than left
+     recording a camera that is about to be replaced. */
+  if (trace && vrec) endRecording("camera", true);
   stopRun(); releaseFile();
   try {
-    stream = await navigator.mediaDevices.getUserMedia({
-      // Asking for 1080p or 4K buys nothing: analysis is capped at
-      // CV.ANALYSIS_MAX regardless, and the larger stream costs decode time,
-      // canvas bandwidth and battery to be thrown away a moment later.
-      video: { facingMode: "environment",
-               width: { ideal: CV.ANALYSIS_MAX }, height: { ideal: 720 } },
-      audio: false,
-    });
+    stream = await navigator.mediaDevices.getUserMedia(CAMERA_CONSTRAINTS);
   } catch (err) {
     $("runNote").className = "note bad";
     $("runNote").textContent = "camera unavailable: " + (err.name || err.message) +
@@ -902,7 +944,8 @@ $("srcCam").onclick = async () => {
   }
   vid.srcObject = stream; vid.removeAttribute("src");
   vid.controls = false; await vid.play();
-  source = "cam"; segment("srcCam"); $("rateRow").classList.add("hidden");
+  store.set("camWanted", true);           // so a reopened app can start it again
+  source = "cam"; segment("srcCam"); $("rateRow").classList.add("hidden"); paintRec();
   showStage(true); sizeOverlay(); updateStart();
   // Report what is actually analysed. getSettings() on Android reports the
   // sensor's own orientation (720x1280) while the element decodes it rotated
@@ -924,6 +967,7 @@ $("playFile").onchange = async e => {
   const file = e.target.files[0];
   if (!file) return;
   stopRun(); stopCamera();
+  store.set("camWanted", false);
   const url = URL.createObjectURL(file);
   vid.srcObject = null;
   try { await loadVideo(vid, url); } catch (err) {
@@ -940,7 +984,9 @@ function segment(onId) {
   ["srcCam", "srcFile"].forEach(id => $(id).classList.toggle("on", id === onId));
 }
 function stopCamera() {
-  camLock = null; paintCamLock(); if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; } }
+  camLock = null; paintCamLock(); if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+  // a recording's video ends on its own when its track stops, and then waits for Save
+  paintRec(); }
 function releaseFile() { if (vid.src) { vid.pause(); vid.removeAttribute("src"); vid.load(); } }
 
 /* ---- calibration stills ------------------------------------------------
@@ -1008,6 +1054,8 @@ function applyCalibration(wound, bare, origin) {
   try {
     const fresh = CV.calibrate(wound, bare);
     fresh.refSmall = Array.from(CV.downsampleGray(wound, 32, 18));
+    // the view this region was fitted in: what a knocked camera is re-aligned against
+    fresh.refView = CV.packView(CV.viewOf(wound));
     cal = fresh;
     refSmall = Float32Array.from(fresh.refSmall);
     store.set("cal", fresh);
@@ -1029,6 +1077,137 @@ function applyCalibration(wound, bare, origin) {
   }
 }
 
+/* Re-align: the saved tube region, slid to where the tube is in the view now.
+   The tube is fixed to the machine and only the tablet moves, so the region's
+   size, angle and colour threshold all still hold; only its position is wrong.
+   CV.alignTo finds the slide by matching this view against the one the region
+   was fitted in, and refuses when the match is weak or ambiguous -- a camera
+   turned or re-aimed, not just knocked -- rather than guess. The baseline is
+   then re-read from the bobbin in view, as Start does, and that keeps its own
+   guard against a bobbin that is not full. Undo puts the region back. */
+let calBeforeAlign = null;
+function realignSay(cls, text) {
+  $("realignNote").className = "note" + (cls ? " " + cls : "");
+  $("realignNote").textContent = text;
+}
+/* Under two cells of the 320-wide view (about 8 px of a 1280 frame) a match is
+   within its own noise -- measured within 2 px on footage -- and moving for it
+   would re-learn stop detection on every check for nothing. */
+const ALIGN_MOVE_CELLS = 2;
+const wayOf = (px, py) => {
+  const way = (n, pos, neg) => n ? `${Math.abs(n)} px ${n > 0 ? pos : neg}` : "";
+  return [way(px, "right", "left"), way(py, "down", "up")].filter(Boolean).join(" and ");
+};
+
+/* Measure the view against the one the region belongs to, and slide the region
+   if the match is confident and the camera has really moved. The button and
+   the automatic check share this, so they cannot disagree about a move. */
+function alignNow() {
+  const img = frameData(), ref = CV.unpackView(cal?.refView);
+  if (!cal || !img || !ref) return { status: "skipped" };
+  const r = CV.alignTo(ref, CV.viewOf(img), cal);
+  if (!r.ok) return { status: "unsure", why: r.why, r };
+  if (Math.abs(r.dx * ref.w) < ALIGN_MOVE_CELLS && Math.abs(r.dy * ref.h) < ALIGN_MOVE_CELLS)
+    return { status: "same", r };
+  const moved = CV.shiftCal(cal, r.dx, r.dy);
+  if (!moved) return { status: "unsure", why: "the tube region would slide out of the picture", r };
+  const px = Math.round(r.dx * img.width), py = Math.round(r.dy * img.height);
+  calBeforeAlign = cal;
+  cal = { ...moved, refView: CV.packView(CV.viewOf(img)),
+          refSmall: Array.from(CV.downsampleGray(img, 32, 18)) };
+  refSmall = Float32Array.from(cal.refSmall);
+  store.set("cal", cal);
+  paintCalChip(); updateStart();
+  $("realignUndo").classList.remove("hidden");
+  return { status: "moved", r, px, py };
+}
+
+/* Stop detection's learned points are pixel positions in the view it learned
+   them in, so a camera that moved needs them learned again. The noise floor is
+   kept -- it describes the sensor, which did not change -- so this is the
+   twelve-second learning phase alone, as after a tow join. */
+function relearnMotion() {
+  runStartedAt = performance.now() / 1000 - NOISE_WARMUP;
+  motionMask = null; maskBuf = prevMaskBuf = null;
+  motionOutside = null; outBuf = prevOutBuf = null;
+  stopAt = undefined; hotCount = null; warmSamples = 0; warmFrames = []; armAttempts = 0;
+  prevMotion = null; prevFull = null; prevGrid = null; movingFor = 0; quietFor = 0;
+}
+
+$("realignBtn").onclick = () => {
+  const a = alignNow();
+  if (a.status === "skipped") { realignSay("bad", "Nothing to re-align against yet — no picture, or no saved view."); return; }
+  if (a.status === "unsure") { realignSay("bad", `Not re-aligned: ${a.why}. Use the two stills below.`); return; }
+  if (a.status === "same") {
+    realignSay("ok", `The camera has not moved (match ${a.r.score.toFixed(2)}) — the region is where it was.`);
+    return;
+  }
+  log?.add(Shift.EV.CALIBRATION_APPLIED, { by: "realign", dx: a.px, dy: a.py, score: +a.r.score.toFixed(2),
+    baseline: cal.baselinePct, ceiling: cal.ceilingPct, creamWarm: cal.creamWarm });
+  relearnMotion();
+  reseedBaseline();
+  realignSay("ok", `Moved the tube region ${wayOf(a.px, a.py)} (match ${a.r.score.toFixed(2)}), and stop ` +
+    `detection is re-learning for 12 s. Check the box sits on the tube; Undo puts it back.`);
+};
+
+/* The same check, made by the app itself at the moments a camera can have
+   moved with nobody watching: back from the background, and at Start and
+   Reset -- before the bobbin is re-read, so that reading goes through the
+   region where the tube actually is. Arun asked for this on 18 Nov.
+
+   A confident move is followed at once, with a note and Undo. A match that is
+   not confident is tried again twice, 5 s apart -- a hand near the lens at the
+   moment the app comes back is the commonest cause -- and only then warned
+   about, out loud. The readings carry on through that warning: holding them
+   would switch off the Bobbin low alarm, and a wrong reading that can still
+   alarm is the lesser failure. */
+const ALIGN_TRIES = 3, ALIGN_RETRY_MS = 5000, ALIGN_AFTER_RETURN_MS = 1000;
+let alignRetry = null, alignEventPending = null;
+const ALIGN_WHEN = { return: "while the app was away", start: "since the last bobbin",
+                     resume: "while the app was closed", reset: "during the swap" };
+function autoAlign(when, attempt = 1) {
+  clearTimeout(alignRetry); alignRetry = null;
+  const a = alignNow();
+  if (a.status === "moved") {
+    /* At Start this runs before the shift's log exists; the event waits and is
+       written as the log opens, so the move is on the record either way. */
+    const ev = { by: "auto-realign", when, dx: a.px, dy: a.py, score: +a.r.score.toFixed(2),
+                 baseline: cal.baselinePct, ceiling: cal.ceilingPct, creamWarm: cal.creamWarm };
+    if (log) log.add(Shift.EV.CALIBRATION_APPLIED, ev); else alignEventPending = ev;
+    relearnMotion();
+    $("runNote").className = "note warn";
+    $("runNote").textContent = `The camera moved ${ALIGN_WHEN[when] || ""}: the tube box followed it, ` +
+      `${wayOf(a.px, a.py)} (match ${a.r.score.toFixed(2)}), and stop detection is re-learning for 12 s. ` +
+      `If the box is not on the tube: Recalibrate → Undo re-align.`;
+    realignSay("ok", `Moved by itself ${wayOf(a.px, a.py)}. Undo puts it back.`);
+  } else if (a.status === "unsure") {
+    if (attempt < ALIGN_TRIES) {
+      alignRetry = setTimeout(() => autoAlign(when, attempt + 1), ALIGN_RETRY_MS);
+    } else {
+      $("runNote").className = "note bad";
+      $("runNote").textContent = `The camera view does not match the calibration: ${a.why}. Check the ` +
+        `camera is aimed at the bobbin, then Recalibrate → Re-align, or redo the two photos. Readings ` +
+        `carry on, but may be wrong until then.`;
+      if (sayOn) try { speechSynthesis.speak(new SpeechSynthesisUtterance("Check the camera")); } catch {}
+    }
+  }
+  /* A Start or Reset that had to skip re-reading the bobbin -- the first try
+     was not sure -- re-reads it once a later try settles where the tube is. */
+  if (attempt > 1 && (when === "start" || when === "reset") && (a.status === "moved" || a.status === "same"))
+    reseedBaseline();
+  return a.status;
+}
+
+$("realignUndo").onclick = () => {
+  if (!calBeforeAlign) return;
+  cal = calBeforeAlign; calBeforeAlign = null;
+  refSmall = cal.refSmall ? Float32Array.from(cal.refSmall) : null;
+  store.set("cal", cal);
+  paintCalChip(); updateStart();
+  $("realignUndo").classList.add("hidden");
+  realignSay("", "Back to the region as it was before re-aligning.");
+};
+
 let rate = 1;
 $("rateUp").onclick = () => setRate(Math.min(8, rate * 2));
 $("rateDown").onclick = () => setRate(Math.max(1, rate / 2));
@@ -1037,6 +1216,7 @@ function setRate(r) { rate = r; vid.playbackRate = r; $("rateVal").textContent =
 function updateStart() {
   $("start").disabled = !(cal && source);
   $("capFull").disabled = $("capBare").disabled = source !== "cam";
+  $("realignBtn").disabled = !(cal && cal.refView && source);
   /* The button follows the SHIFT, not the run. Changing source stops the run
      without ending anything, and if the button went back to "Start" there would
      be no way left to close the shift. It once kept the "End" label while still
@@ -1172,7 +1352,7 @@ $("reset").onclick = () => {
   $("runNote").textContent =
     `reset — stop detection waits ${joinWindow}s for the tow join, then expects the bobbin to turn`;
   paintTally();           // this press starts the next bobbin; show it at once
-  if (cal && source) reseedBaseline();
+  if (cal && source && autoAlign("reset") !== "unsure") reseedBaseline();
 };
 
 function resetRun() {
@@ -1314,6 +1494,16 @@ $("autoCalNo").onclick = () => {
 function reseedBaseline() {
   const img = frameData();
   if (!img) return;
+  /* A calibration made before re-alignment existed has no reference view.
+     Take one now -- but only if this view still matches the one the region was
+     fitted on. If it does not, the region is already off, and a reference taken
+     from here would lock the error in for good. Taken before the full-bobbin
+     check below, because the tube is left out of any match anyway. */
+  if (!cal.refView && refSmall && CV.driftCheck(refSmall, img, cal) <= DRIFT_WARN) {
+    cal.refView = CV.packView(CV.viewOf(img));
+    store.set("cal", cal);
+    updateStart();
+  }
   const before = CV.measure(img, cal);
   if (before === null) return;
   if (before > RESEED_MAX) {
@@ -1363,7 +1553,13 @@ async function startRun({ resume = false } = {}) {
   /* Not on a resume. The bobbin on the machine is part used, and fitting the
      threshold to a tube that is already showing would set it above the tan --
      the run would then read zero to the end. See RESEED_MAX. */
-  if (!resume) reseedBaseline();
+  /* Through the region where the tube is NOW: a camera knocked while the app
+     was closed or between bobbins is followed before the bobbin is read. A
+     check that is not yet sure skips the re-read and keeps the stored values. */
+  const aligned = autoAlign(resume ? "resume" : "start");
+  // kept for the note Start writes last, which would otherwise wipe it
+  const alignedNote = aligned === "moved" ? $("runNote").textContent : "";
+  if (!resume && aligned !== "unsure") reseedBaseline();
   // The first tap of the session is the only chance to unlock audio on iOS,
   // and it has to happen before anything needs to make a sound.
   audio = audio || new (window.AudioContext || window.webkitAudioContext)();
@@ -1418,17 +1614,18 @@ async function startRun({ resume = false } = {}) {
         creamWarm: cal.creamWarm ?? null });
   }
   log.add(Shift.EV.RUN_STARTED);
+  if (alignEventPending) { log.add(Shift.EV.CALIBRATION_APPLIED, alignEventPending); alignEventPending = null; }
   $("bobbinDone").disabled = false;
   paintTally();
   runStartedAt = performance.now() / 1000;
   updateStart();
   $("dot").className = "dot live"; $("mState").textContent = "monitoring";
-  $("runNote").className = "note";
-  $("runNote").textContent = restoredGap
+  $("runNote").className = alignedNote ? "note warn" : "note";
+  $("runNote").textContent = [alignedNote, restoredGap
     ? `Carried the shift on. The ${mmss(restoredGap.away)} the app was closed is recorded as `
       + `idle${restoredGap.moving ? ", and the run it was in the middle of was closed at that point" : ""}`
       + ` — not as production, and not as a machine fault.`
-    : resume ? `Monitoring resumed — stop detection re-arms in ${MOTION_WARMUP}s.` : "";
+    : resume ? `Monitoring resumed — stop detection re-arms in ${MOTION_WARMUP}s.` : ""].filter(Boolean).join(" ");
   restoredGap = null;
   startBeating();
   loop();
@@ -1453,6 +1650,8 @@ function sourceTime() {
 function loop() {
   if (!running) return;
   rafId = requestAnimationFrame(loop);
+  // a camera being brought back shows a frozen or black frame: nothing to read
+  if (camReviving) return;
   const now = sourceTime();
   // Sample in SOURCE time, so a clip replayed at 4x is scored at the same rate
   // per video-second as a live run. Otherwise fast-forwarding silently starves
@@ -1488,7 +1687,7 @@ function loop() {
   const grid = CV.downsampleGray(img, 32, 18);
   if (refSmall) {
     const drift = CV.driftCheck(refSmall, img, cal);
-    $("mDrift").textContent = drift > DRIFT_WARN ? `drift ${drift.toFixed(0)} — recalibrate?` : "";
+    $("mDrift").textContent = drift > DRIFT_WARN ? `drift ${drift.toFixed(0)} — camera moved? Recalibrate → Re-align` : "";
     $("mDrift").style.color = drift > DRIFT_WARN ? "var(--amber)" : "";
   }
   if (faultOn) checkStopped(img, grid);
@@ -1767,18 +1966,35 @@ function checkStopped(img, grid) {
      noisy frame cannot fake one, and is backdated by that hold so the recorded
      time is when the machine actually moved, not when we were convinced.
 
+     That backdate is floored at the last stop, and it has to be. The hold is
+     counted in SAMPLE_S units off `movingFor`, but subtracted as a flat
+     RESUME_HOLD seconds off the wall clock. Frames do not arrive exactly every
+     SAMPLE_S: when they run a shade fast, movingFor reaches the hold before
+     that many real seconds have passed, and the full subtraction reaches back
+     further than the machine was ever still -- past the stop it ends. On the
+     17 Nov run it overshot by 2 ms, which sounds harmless and is not.
+     motionIntervals pairs these events in time order and opens an interval
+     only when none is open, so a restart that sorts BEFORE its own stop is
+     dropped, and with it the whole span it opened: 78 s of real running
+     vanished from that bobbin and an 84 s fault that never happened took its
+     place. Flooring costs the backdate nothing in the normal case and makes
+     that inversion unrepresentable.
+
      The depletion reading at a stop is kept with it: it is what tells a stop
      at 40% in the rush apart from the real one at 99%. The surround is kept on
      both, so a restart that should not have been believed can be found later. */
   const around = o === null ? null : +o.toFixed(1);
   if (machineMoving && quietFor > 0) {
     machineMoving = false;
-    log?.add(Shift.EV.MOTION_STOPPED, { pct: +clamped.toFixed(1), outside: around });
+    // the event's own t, so the floor below is on the same clock add() used
+    lastStopAt = log?.add(Shift.EV.MOTION_STOPPED,
+                          { pct: +clamped.toFixed(1), outside: around })?.t ?? Date.now();
   } else if (!machineMoving && movingFor >= RESUME_HOLD) {
     machineMoving = true;
     alertHoldUntil = 0;     // the hold covered the stop the operator dealt with, not the next
+    const backdated = Date.now() - RESUME_HOLD * 1000;
     log?.add(Shift.EV.MOTION_STARTED, { level: +m.toFixed(1), outside: around },
-             Date.now() - RESUME_HOLD * 1000);
+             lastStopAt === null ? backdated : Math.max(backdated, lastStopAt + 1));
   }
   /* "around" is the surround's figure. When the mask is moving but the
      surround is moving too, say that it is being discounted -- otherwise a
@@ -2262,9 +2478,64 @@ function resumeFromHidden() {
     + `not as running, and not as a machine fault. Watching the machine again.`;
 }
 
+/* The camera, after the app comes back to the foreground.
+
+   Android stops or mutes the camera while the app is in the background, and
+   on the way back the picture stays frozen: the operator had to find Live
+   camera and tap it, and that tap also stopped the run. This brings the
+   camera back by itself and touches nothing else -- the run keeps running,
+   the shift, calibration, learned mask and noise floor all stay as they were.
+   The view and the sensor did not change while we were away, so neither did
+   what was learned about them.
+
+   What it does hold back is the readings. A re-acquired camera starts on auto
+   exposure, and a frame brightening as exposure settles reads as motion over
+   the whole grid; so nothing is sampled until the lock is back on, and the
+   first comparison after that is against a fresh frame. A track that is only
+   muted gets a moment to come back by itself before it is replaced. */
+const CAM_UNMUTE_WAIT_MS = 1500;
+let camReviving = false;
+async function reviveCamera() {
+  if (source !== "cam" || camReviving) return;
+  const track = () => stream?.getVideoTracks?.()[0];
+  const alive = () => track()?.readyState === "live" && !track().muted;
+  if (alive()) { if (vid.paused) vid.play().catch(() => {}); return; }
+  camReviving = true;
+  try {
+    if (track()?.readyState === "live") {               // muted, not gone
+      await new Promise(r => setTimeout(r, CAM_UNMUTE_WAIT_MS));
+      if (alive()) { if (vid.paused) await vid.play().catch(() => {}); return; }
+    }
+    // Stopping the old track ends a recording on it, which then saves itself
+    stream?.getTracks?.().forEach(t => t.stop());
+    stream = await navigator.mediaDevices.getUserMedia(CAMERA_CONSTRAINTS);
+    vid.srcObject = stream;
+    await vid.play();
+    camLock = null; paintCamLock();
+    $("camLockNote").className = "note";
+    $("camLockNote").textContent = "Camera back from the background — letting exposure settle, then locking…";
+    paintCamLock(await lockCamera());
+    $("runNote").className = "note ok";
+    $("runNote").textContent = "The camera restarted by itself after the app came back" +
+      (running ? ". Watching the machine again." : ".");
+  } catch (err) {
+    $("runNote").className = "note bad";
+    $("runNote").textContent = "The camera did not come back after the app was in the background (" +
+      (err.name || err.message) + "). Tap Live camera.";
+  } finally {
+    camReviving = false;
+    prevMotion = null; prevFull = null; prevGrid = null; movingFor = 0; quietFor = 0;
+    paintRec();
+  }
+}
+
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "hidden") { pauseForHidden(); return; }
   resumeFromHidden();
+  /* Camera first, then the check: it needs a live picture to match. */
+  reviveCamera().then(() => setTimeout(() => {
+    if (document.visibilityState === "visible") autoAlign("return");
+  }, ALIGN_AFTER_RETURN_MS));
   if (running) navigator.wakeLock?.request("screen").then(w => wakeLock = w).catch(() => {});
 });
 
@@ -2718,12 +2989,22 @@ function startRecording() {
   };
   traceCur = null;
   traceShot("recording started");
+  recPending = null;
+  const filmed = videoOn && cameraLive() && startVideo(trace);
   paintRec();
   $("recNote").className = "note ok";
-  $("recNote").textContent = "Recording what the detector measures. Press again to save it.";
+  $("recNote").textContent = filmed
+    ? "Recording what the detector measures, and the camera with it. Press again to save both."
+    : "Recording what the detector measures. Press again to save it.";
 }
 
-function stopRecording() {
+/* Ends a recording, whatever ended it: the button, End, the camera going away,
+   or the video's length cap. `tap` is whether a press is in progress to allow
+   downloads. With one, the files are written now; without one -- or with a
+   video that has nothing in hand yet -- they wait behind Save. */
+function stopRecording(by = "button") { endRecording(by, true); }
+
+function endRecording(by, tap) {
   if (!trace) return;
   traceFlush();
   traceShot("recording stopped");
@@ -2741,21 +3022,107 @@ function stopRecording() {
      is worth recording. */
   if (!t.events?.length) t.events = log ? log.events : [];
   trace = null; traceCur = null;
-  paintRec();
-
+  // one stamp for every file, so a trace and its video cannot be mismatched
   const stamp = fileStamp();
+  const v = vrec;
+  if (!v) { saveRecording(packRecording(t, null, null, stamp)); return; }
+
+  vrec = null;
+  clearInterval(v.timer);
+  v.wake?.release?.().catch(() => {});
+  const endedAt = Date.now(), endClock = performance.now() / 1000;
+  let stopping = false;
+  try { if (v.rec.state !== "inactive") { v.rec.stop(); stopping = true; } }
+  catch { /* already stopped */ }
+  /* Every ending saves on its own, as soon as the files exist. Arun, 18 Nov:
+     "make sure the traces and video are saved automatically upon stopping".
+
+     A save inside a tap, or a moment after one, is the case Chrome is known to
+     allow: a press stays usable for a few seconds, and a recorder that has
+     nothing in hand at the press hands over its last piece within
+     milliseconds. A save with no tap behind it -- the length cap, the camera
+     going away -- is attempted all the same, but nobody has shown the tablet
+     allows it, so that recording also stays behind Save again until the next
+     press. Nothing can be lost to a refused download that way, at the cost of
+     one tap in the uncommon case. */
+  const tapAt = tap ? Date.now() : null;
+  const finish = () => {
+    if (v.done) return;
+    v.done = true;
+    recFinishing = false;
+    const blob = new Blob(v.chunks, { type: v.mime.split(";")[0] });
+    v.chunks = [];
+    const out = packRecording(t, v, blob, stamp, { by, endedAt, endClock });
+    const covered = tapAt !== null && Date.now() - tapAt < TAP_GRACE_MS;
+    saveRecording(out);
+    if (covered) return;
+    recPending = out;                    // kept, in case that save was refused
+    paintRec();
+    $("recNote").className = "note warn";
+    $("recNote").textContent = (by === "cap" ? `Stopped at the ${VIDEO_MAX_S / 60}-minute video limit `
+      : by === "lost" ? "The camera went away, so recording stopped " : "Recording finished ") +
+      "and saved automatically. If any file is missing from Downloads, tap Save again — " +
+      "this copy is lost if the page is closed or reloaded first.";
+  };
+  if (tap && v.chunks.length) { finish(); return; }
+  if (!stopping) { finish(); return; }
+  /* Nothing in hand to write inside this press. Wait for the recorder -- a few
+     milliseconds, normally -- and save the whole recording then. */
+  recFinishing = true;
+  v.rec.onstop = v.rec.onerror = () => finish();
+  setTimeout(finish, VIDEO_WAIT_MS);                   // a recorder that never answers
+  paintRec();
+  $("recNote").className = "note";
+  $("recNote").textContent = "Finishing the video…";
+}
+
+/* The files of one recording, in the order they are written. The video goes
+   into the trace's own description, so the JSON says which video it belongs to
+   and how they line up, and the CSV carries the alignment row by row. */
+function packRecording(t, v, blob, stamp, end = {}) {
+  const files = [];
+  let video = null;
+  if (v) {
+    const name = `tow-trace-${stamp}.${videoExt(v.mime)}`;
+    t.video = { ...(t.video || { mime: v.mime, bps: VIDEO_BPS, settings: v.settings, locked: v.locked }),
+                file: name, bytes: blob.size, endedBy: end.by,
+                seconds: Math.round((end.endedAt - v.startedAt) / 100) / 10,
+                endClock: +end.endClock.toFixed(3) };
+    log?.add(Shift.EV.VIDEO_STOPPED, { file: name, seconds: t.video.seconds,
+                                       bytes: blob.size, by: end.by }, end.endedAt);
+    if (blob.size) video = { name, blob };
+  }
+  files.push({ name: `tow-trace-${stamp}.json`, text: JSON.stringify(t), type: "application/json" });
+  files.push({ name: `tow-trace-${stamp}.csv`, text: traceCSV(t), type: "text/csv" });
+  if (video) files.push({ name: video.name, blob: video.blob, type: video.blob.type });
+  return { files, trace: t, seconds: t.video?.seconds ?? (t.endedAt - t.startedAt) / 1000,
+           bytes: files.reduce((n, f) => n + (f.blob ? f.blob.size : f.text.length), 0) };
+}
+
+function saveRecording(out) {
+  recPending = null;
+  const t = out.trace;
   const mins = Math.round((t.endedAt - t.startedAt) / 60000);
   let wrote = 0, failed = false;
   try {
-    download(`tow-trace-${stamp}.json`, JSON.stringify(t), "application/json");
-    download(`tow-trace-${stamp}.csv`, traceCSV(t), "text/csv");
-    wrote = 2;
+    for (const f of out.files) {
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(f.blob || new Blob([f.text], { type: f.type }));
+      a.download = f.name;
+      a.click();
+      // longer than download()'s 10 s: a large video can take a moment to start
+      setTimeout(() => URL.revokeObjectURL(a.href), 60_000);
+      wrote++;
+    }
   } catch { failed = true; }
+  paintRec();
+  const vid = out.files.find(f => f.blob);
   $("recNote").className = "note " + (failed ? "warn" : "ok");
   $("recNote").textContent = failed
     ? "Recorded, but the files could not be written."
     : `Saved ${wrote} files to Downloads — ${t.rows.length} samples over ${mins} min, ` +
       `${t.arms.length} arming attempt${t.arms.length === 1 ? "" : "s"}, ${t.shots.length} stills` +
+      (vid ? `, and ${mmss(t.video.seconds)} of video (${mb(vid.blob.size)})` : "") +
       (t.truncated ? ". Stopped recording samples at the 4-hour cap." : ".");
 }
 
@@ -2763,11 +3130,18 @@ function stopRecording() {
 function traceCSV(t) {
   const cols = ["t", "phase", "whole", "mask", "outside", "stopAt", "pct", "warm",
                 "moving", "quietFor", "movingFor", "attended"];
-  const rows = t.rows.map(r => cols.map(c => {
+  /* videoT: seconds into the video at which this sample was taken, from the
+     same clock both were stamped with. In the CSV as well as the JSON because
+     the CSV is the file that has always reached Downloads -- the alignment
+     should survive the one that has not. Empty outside the video. */
+  const v0 = t.video?.startClock, v1 = t.video?.endClock;
+  const videoT = r => v0 === undefined || r.t < v0 || (v1 !== undefined && r.t > v1) ? ""
+                    : Math.round((r.t - v0) * 1000) / 1000;
+  const rows = t.rows.map(r => [...cols.map(c => {
     const v = r[c];
     return v === undefined || v === null ? "" : typeof v === "boolean" ? (v ? 1 : 0) : v;
-  }).join(","));
-  return [cols.join(","), ...rows].join("\n");
+  }), videoT(r)].join(","));
+  return [[...cols, "videoT"].join(","), ...rows].join("\n");
 }
 
 /* How this run is going against the one to beat. The two figures that matter
@@ -2826,13 +3200,175 @@ fetch("./baseline.json", { cache: "no-cache" })
   .catch(() => {});
 
 function paintRec() {
-  $("recBtn").textContent = trace
-    ? "Stop and download traces" : "Record run (traces)";
-  $("recBtn").classList.toggle("seg", true);
-  $("recBtn").classList.toggle("on", !!trace);
+  const b = $("recBtn");
+  if (trace && vrec) {
+    const s = Math.max(0, Math.round((Date.now() - vrec.startedAt) / 1000));
+    b.textContent = `● Stop and download · ${mmss(s)} · ${mb(vrec.bytes)}`;
+  } else if (trace) b.textContent = "Stop and download traces";
+  else if (recFinishing) b.textContent = "Finishing video…";
+  else if (recPending) b.textContent = `Save again · ${mmss(recPending.seconds)} · ${mb(recPending.bytes)}`;
+  else b.textContent = videoOn && cameraLive() ? "Record run (traces + video)" : "Record run (traces)";
+  b.disabled = recFinishing;
+  b.classList.toggle("seg", true);
+  b.classList.toggle("on", !!trace);
+  paintVideoSwitch();
 }
+$("recBtn").onclick = () => trace ? stopRecording()
+                       : recPending ? saveRecording(recPending)
+                       : recFinishing ? null : startRecording();
+
+/* ---- video, recorded with the traces -----------------------------------
+   The traces record what the detector concluded; the video records what it was
+   looking at, so a run can be labelled by eye afterwards and every reading
+   scored against what really happened. It is the same MediaStream the
+   detector samples, so whatever lockCamera() achieved -- exposure, white
+   balance and focus held fixed -- is in the video too, and nothing is drawn on
+   it: the ROI and the overlays live on a separate canvas.
+
+   The two are stamped on one clock. The trace's rows carry performance-clock
+   seconds, and the video's first frame is stamped on the same clock when the
+   recorder starts, so every row knows where it falls in the video (videoT).
+
+   SIZE. 1.5 Mbps, about 11 MB a minute. Measured on 18 Nov by re-encoding the
+   reference clip (848x478, 1.56 Mbps) smaller and replaying the shipped
+   detector over the result from 26 start times against eye-checked labels:
+   down to 400 kbps -- a quarter of the clip's size -- every stop was still
+   caught, nothing false, and readings moved by about a point; at 200 kbps
+   stopped and running readings began to overlap. A lower frame rate was worse
+   at the same size, since frames further apart compress less well, so the
+   saving comes from the bitrate. The tablet films 2.3x the pixels with a
+   hardware encoder less efficient than the one measured, which is what
+   1.5 Mbps allows for.
+
+   SAVING HAPPENS ON THE TAP. Chrome refuses a download outside a gesture, and
+   MediaRecorder hands over its last piece only after stop() has returned --
+   asynchronously, so outside it. The video is therefore assembled from the
+   one-second pieces already delivered, inside the Stop press, at the cost of
+   at most the final second. With nothing in hand to assemble, the recording
+   waits for the recorder and goes behind Save -- as does one ended with no tap
+   at all, by the length cap or the camera going away.
+
+   Not kept across a reload. The pieces live in this page, and a page cannot
+   write a download while it is being torn down. */
+const VIDEO_BPS = 1_500_000;      // ~11 MB a minute; see SIZE above
+const VIDEO_MAX_S = 20 * 60;      // a whole bobbin with its swap and join: ~220 MB
+const VIDEO_SLICE_MS = 1000;      // also the most a Stop press can cut off the end
+const VIDEO_WAIT_MS = 5000;       // how long a stopping recorder is given to hand over
+const TAP_GRACE_MS = 4000;        // a press still counts this long after it, for a download
+/* Measured in Chrome on 18 Nov, a 1280x720 camera for 4 s with a 1 s slice:
+     webm;codecs=h264  a piece every second -- written as Matroska, not WebM
+     webm;codecs=vp8   a piece every second
+     mp4;codecs=avc1   nothing at all until stop(), then all of it at once
+   MP4 is left out for that last line: with nothing delivered before the press,
+   the save inside it has nothing to save. H.264 first because Android encodes
+   it in hardware, and the tablet is running the detector at the same time.
+   Every format here opens in ffmpeg and OpenCV. */
+const VIDEO_TYPES = ["video/webm;codecs=h264", "video/webm;codecs=vp8", "video/webm"];
+let videoOn = store.get("videoOn", true);
+let vrec = null;                  // the video of the recording in progress
+let recFinishing = false;         // stopped, waiting for the video's last piece
+let recPending = null;            // a finished recording waiting for a tap to save it
+
+function videoType() {
+  if (typeof MediaRecorder === "undefined") return null;
+  return VIDEO_TYPES.find(t => MediaRecorder.isTypeSupported?.(t)) ?? "";
+}
+// From what the recorder reports writing, which is not always what was asked for
+const videoExt = mime => /matroska/.test(mime) ? "mkv" : /mp4/.test(mime) ? "mp4" : "webm";
+const mb = n => `${(n / 1048576).toFixed(n < 10485760 ? 1 : 0)} MB`;
+const cameraLive = () =>
+  source === "cam" && stream?.getVideoTracks?.()[0]?.readyState === "live";
+
+function vidSay(cls, text) {
+  $("vidNote").className = "note" + (cls ? " " + cls : "");
+  $("vidNote").textContent = text;
+}
+
+/* Starts the video for trace `t`. Returns whether it did; a recording whose
+   video cannot start still records its traces. */
+function startVideo(t) {
+  const mime = videoType();
+  if (mime === null) {
+    vidSay("bad", "This browser cannot record video, so recordings save traces only.");
+    return false;
+  }
+  let rec;
+  try {
+    rec = new MediaRecorder(stream, { ...(mime ? { mimeType: mime } : {}),
+                                      videoBitsPerSecond: VIDEO_BPS });
+  } catch (err) {
+    vidSay("bad", `Could not start the video: ${err.name || err.message}. Recording traces only.`);
+    return false;
+  }
+  /* What the camera was actually doing, read off the track rather than taken
+     from what was asked for, so an analysis can tell a locked clip from a
+     drifting one. */
+  let s = {};
+  try { s = stream.getVideoTracks()[0].getSettings() || {}; } catch { /* empty is fine */ }
+  const settings = {};
+  for (const k of ["width", "height", "frameRate", "exposureMode", "exposureTime", "iso",
+                   "whiteBalanceMode", "colorTemperature", "focusMode", "focusDistance"])
+    if (s[k] !== undefined) settings[k] = s[k];
+
+  const v = vrec = { rec, chunks: [], bytes: 0, startedAt: Date.now(), settings,
+                     mime: rec.mimeType || mime || "video/webm",
+                     locked: !!camLock?.ok, timer: null, wake: null, done: false };
+  rec.ondataavailable = e => {
+    if (!v.done && e.data?.size) { v.chunks.push(e.data); v.bytes += e.data.size; }
+  };
+  rec.onstart = () => {
+    /* When frames actually began -- what the video is lined up by. Both clocks
+       are read here: the wall clock for the shift log, the performance clock
+       for the trace rows. */
+    v.startedAt = Date.now();
+    v.mime = rec.mimeType || v.mime;
+    t.video = { mime: v.mime, bps: VIDEO_BPS, settings, locked: v.locked,
+                startedAt: v.startedAt, startClock: +(performance.now() / 1000).toFixed(3) };
+    log?.add(Shift.EV.VIDEO_STARTED, { mime: v.mime, bps: VIDEO_BPS, locked: v.locked,
+                                       settings }, v.startedAt);
+  };
+  // Ending on its own means the camera went: the track stopped or was taken
+  rec.onstop = () => { if (vrec === v) endRecording("lost", false); };
+  rec.onerror = () => { if (vrec === v) endRecording("lost", false); };
+  try { rec.start(VIDEO_SLICE_MS); }
+  catch (err) {
+    vrec = null;
+    vidSay("bad", `Could not start the video: ${err.name || err.message}. Recording traces only.`);
+    return false;
+  }
+
+  v.timer = setInterval(() => {
+    if ((Date.now() - v.startedAt) / 1000 >= VIDEO_MAX_S) endRecording("cap", false);
+    else paintRec();
+  }, 1000);
+  // The screen going off can take the camera with it, and the recording too
+  navigator.wakeLock?.request?.("screen").then(w => {
+    if (vrec === v) v.wake = w; else w.release?.().catch(() => {});
+  }).catch(() => {});
+  vidSay(v.locked ? "ok" : "warn", v.locked
+    ? "Filming with exposure, white balance and focus locked, as the detector sees it."
+    : "Filming — but the camera is NOT locked, so exposure can drift in this video. " +
+      "Stop, press Lock camera, and start again if that matters for this run.");
+  return true;
+}
+
+function paintVideoSwitch() {
+  const b = $("vidBtn");
+  b.textContent = `Video with recordings: ${videoOn ? "ON" : "OFF"}`;
+  b.disabled = !!trace || recFinishing;
+  b.classList.toggle("seg", true);
+  b.classList.toggle("on", videoOn);
+}
+
+$("vidBtn").onclick = () => {
+  videoOn = !videoOn;
+  store.set("videoOn", videoOn);
+  paintRec();
+  vidSay("", videoOn
+    ? `Recordings will film the camera too: about 11 MB a minute, up to ${VIDEO_MAX_S / 60} minutes.`
+    : "Recordings will save the traces only — a few hundred KB an hour.");
+};
 paintRec();
-$("recBtn").onclick = () => trace ? stopRecording() : startRecording();
 
 /* Shift.exportFiles decides which files there are and what is in them; this
    only hands each one to the browser. Returns how many were written. */
@@ -2889,6 +3425,18 @@ $("verChip").textContent = `v${VERSION}` + (BUILD === "dev" ? " dev" : ` · ${BU
 
 if ("serviceWorker" in navigator)
   navigator.serviceWorker.register("sw.js").catch(() => {});
+
+/* A reopened app starts the camera itself, if the camera was what it was using.
+   Android discards a page that has sat in the background long enough, and on
+   the way back the page loads from scratch: calibration and the open shift come
+   back from storage, and resumeShift() restarts the run as soon as there is a
+   camera -- the one thing that waited for a tap. Camera permission is already
+   granted to this site by then, so no tap is needed to ask for it.
+
+   It must stay the LAST statement in this script. The camera handler reaches
+   variables declared all the way down the file, and running it any earlier is
+   the same temporal-dead-zone failure that killed the app at load (fa5ab4d). */
+if (store.get("camWanted", false) && navigator.mediaDevices?.getUserMedia) $("srcCam").onclick();
 </script>
 </body>
 </html>

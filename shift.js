@@ -41,6 +41,11 @@ const EV = {
   JOIN_STARTED:           "join.started",          // Reset: the tow is being joined
   JOIN_ENDED:             "join.ended",            // { by: "motion" | "reset" | "end" | "stopped" }
   CAMERA_LOCKED:          "camera.locked",         // { got, asked } exposure/WB/focus
+  /* A raw video was recorded. Nothing derived from the log reads these; they
+     are here so a video can be lined up against everything else the shift
+     recorded, to the millisecond, by whoever analyses it. */
+  VIDEO_STARTED:          "video.started",         // { file, mime, bps, locked, settings }
+  VIDEO_STOPPED:          "video.stopped",         // { file, seconds, bytes, by }
 };
 
 /* A run that ended with no alert is either one we failed to warn about or one
@@ -159,7 +164,50 @@ function derive(events, { now = null, missAbovePct = MISS_ABOVE_PCT } = {}) {
      everywhere -- per run, per completed bobbin and per shift alike. */
   const swapWindows = cuts.filter(c => c.closer.type === EV.RUN_RESET)
                           .map(c => ({ start: c.closeAt, end: c.closer.t }));
-  const running = subtract(raw, swapWindows);
+
+  /* The tow join. Reset means a new scrap bobbin is on; the operator closes the
+     door and presses the tow-join button, and for about 100 s the new tow is
+     joined to the tail of the old one. The bobbin is NOT still through this --
+     the join shifts and the heating element runs along a length of it -- but
+     none of that is the machine making a bobbin. How it closed is kept on the
+     JOIN_ENDED event.
+
+     So a join is cut out of running time exactly as a swap is, whatever moved
+     inside it. Before this, joins were measured and reported but never cut,
+     and the page has a way of carrying motion straight into one: Reset sets
+     machineMoving false without writing a motion.stopped, so a motion interval
+     open at the press -- hands in view during the swap, which is normal, or
+     the detector misreading a still bobbin -- ran on through the whole join and
+     was booked as the new bobbin's production. It also hid the join itself:
+     with motion already present at the run's first instant, the per-run
+     joinSeconds below found no lead gap and stayed blank. On 17 Nov the shift
+     measured 599.6 s of join and credited 289.5 s of it to bobbins.
+
+     An OPEN window (no JOIN_ENDED) is either a join happening right now, or one
+     whose end was lost: the page reloaded mid-join, and nothing on the way back
+     writes the JOIN_ENDED -- there is no join equivalent of openPauseAt. Run to
+     the horizon, the first is right and the second would now erase every second
+     of production for the rest of the shift. So an open window ends at the
+     first sign the join is over: the machine confirmed turning, or the next
+     Reset or the end of the shift. A join still in progress has none of those
+     yet, and runs to now. */
+  const joins = [];
+  let openJ = null;
+  for (const e of ev) {
+    if (e.type === EV.JOIN_STARTED && !openJ) openJ = e;
+    else if (e.type === EV.JOIN_ENDED && openJ) {
+      joins.push({ start: openJ.t, end: e.t, by: e.by ?? null });
+      openJ = null;
+    }
+  }
+  if (openJ) {
+    const over = ev.find(e => e.t > openJ.t &&
+                              (e.type === EV.MOTION_STARTED || CLOSERS.includes(e.type)));
+    joins.push({ start: openJ.t, end: over ? Math.min(over.t, horizon) : horizon,
+                 by: null, open: true });
+  }
+
+  const running = subtract(raw, [...swapWindows, ...joins]);
 
   /* Time after a bobbin is completed, when no bobbin is being made: from the
      completion until the machine turns again on the next. Changing the bobbin
@@ -223,22 +271,7 @@ function derive(events, { now = null, missAbovePct = MISS_ABOVE_PCT } = {}) {
   if (openH) hidden.push({ start: openH.t, end: horizon, open: true });
   const hiddenIn = (from, to) => within(hidden, from, to);
 
-  /* The tow join. Reset means a new scrap bobbin is on, and the new tow then
-     has to be joined to the tail of the old one -- about a minute, with the
-     machine deliberately still, after which it starts turning by itself. The
-     window is recorded so the stillness can be told apart from a machine that
-     stopped on its own: the same silence, opposite meanings. How it closed is
-     kept on the JOIN_ENDED event. */
-  const joins = [];
-  let openJ = null;
-  for (const e of ev) {
-    if (e.type === EV.JOIN_STARTED && !openJ) openJ = e;
-    else if (e.type === EV.JOIN_ENDED && openJ) {
-      joins.push({ start: openJ.t, end: e.t, by: e.by ?? null });
-      openJ = null;
-    }
-  }
-  if (openJ) joins.push({ start: openJ.t, end: horizon, by: null, open: true });
+  // `joins` itself is built above `running`, which it is cut out of
   const joinIn = (from, to) => within(joins, from, to);
 
   const idle = [];            // every stopped period counted as idle during a build
@@ -556,6 +589,46 @@ function bobbinsCSV(bobbins, shift) {
   return [cols.join(","), ...rows.map(r => r.join(","))].join("\n");
 }
 
+/* The shift on one line: what End is for.
+ *
+ * bobbinsCSV answers "how did each completed bobbin go", which is a different
+ * question and a different number of rows -- none at all on a shift that ended
+ * before anything was finished, which is exactly the shift someone wants a
+ * summary of. The three figures asked for are first: scrap bobbins used, run
+ * time, idle time. The rest is there so the row can be read six weeks later
+ * without the JSON beside it.
+ *
+ * elapsedSeconds is run plus total idle: the wall clock this shift accounts
+ * for. utilisationPct is NOT run/elapsed -- it leaves out the time between one
+ * bobbin finishing and the next starting, because a shift should not look worse
+ * the more bobbins it completes. Both columns are here so the difference is
+ * visible rather than argued about. */
+function shiftCSV(shifts) {
+  const cols = ["shift", "shiftName", "startedAt", "endedAt", "elapsedSeconds",
+                "scrapBobbins", "totalRunSeconds", "totalIdleSeconds", "utilisationPct",
+                "bobbinsCompleted", "idleDuringBobbinBuildSeconds",
+                "idleAfterBobbinCompleteSeconds", "swapSeconds",
+                "towJoinSeconds", "towJoins", "towJoinsWithoutMotion",
+                "attendedSeconds", "interventions", "appPausedSeconds", "appPauses",
+                "faultStopCount", "faultStopSeconds",
+                "depletionPauseCount", "depletionPauseSeconds",
+                "missedAlerts", "abandoned", "medianWarningSeconds"];
+  const iso = t => (t ? new Date(t).toISOString() : "");
+  const r1 = x => Math.round(x * 10) / 10;
+  const rows = shifts.filter(Boolean).map(s => [
+    s.shiftNo ?? "", s.name ?? "", iso(s.startedAt), iso(s.endedAt),
+    r1((s.totalRunSeconds || 0) + (s.totalIdleSeconds || 0)),
+    s.scrapBobbins, s.totalRunSeconds, s.totalIdleSeconds, s.utilisation ?? "",
+    s.bobbinsCompleted, s.idleDuringBobbinBuildSeconds,
+    s.idleAfterBobbinCompleteSeconds, s.swapSeconds,
+    s.towJoinSeconds, s.towJoins, s.towJoinsWithoutMotion,
+    s.attendedSeconds, s.interventions, s.appPausedSeconds, s.appPauses,
+    s.faultStopCount, s.faultStopSeconds,
+    s.depletionPauseCount, s.depletionPauseSeconds,
+    s.missedAlerts, s.abandoned, s.medianWarningSeconds ?? ""]);
+  return [cols.join(","), ...rows.map(r => r.join(","))].join("\n");
+}
+
 /* An export, as names and contents. The page only has to hand each one to the
  * browser, which is the part that cannot be tested outside one -- everything
  * about which files appear, what they are called and what is in them is here.
@@ -580,6 +653,13 @@ function exportFiles(bundle, stamp, { now = null } = {}) {
   if (bRows.length) files.push({
     name: `tow-bobbins-${stamp}.csv`, type: "text/csv",
     text: [bobbinsCSV([], null).split("\n")[0], ...bRows].join("\n"),
+  });
+  /* Unconditional, unlike the bobbins file. A shift that finished no bobbins
+     still used scrap bobbins and still stood idle, and that is the shift whose
+     summary is hardest to reconstruct afterwards. */
+  files.push({
+    name: `tow-shift-summary-${stamp}.csv`, type: "text/csv",
+    text: shiftCSV(derived.map(d => d.shift)),
   });
   files.push({
     name: `tow-shifts-${stamp}.json`, type: "application/json",
@@ -638,7 +718,7 @@ function openPauseAt(events) {
   return at;
 }
 
-const Shift = { EV, MISS_ABOVE_PCT, derive, toCSV, bobbinsCSV, createLog, motionIntervals,
+const Shift = { EV, MISS_ABOVE_PCT, derive, toCSV, bobbinsCSV, shiftCSV, createLog, motionIntervals,
                 openPauseAt, exportFiles, fileSlug };
 
 if (typeof module !== "undefined" && module.exports) module.exports = Shift;

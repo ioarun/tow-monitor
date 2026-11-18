@@ -896,6 +896,193 @@ function armingDecision({ frames, floor, cols, rows, hotFrac, minMask,
   return out;
 }
 
+/* --- re-aligning a saved tube region to a camera that has been nudged -----
+ * The tube does not move: it is the core of the bobbin, on a machine bolted
+ * to the floor. What moves is the tablet. A saved region is fractions of the
+ * frame, so a knocked mount leaves it measuring the wrong pixels, and the only
+ * remedy used to be a full two-still calibration -- which needs a bare tube,
+ * i.e. a bobbin run down to nothing.
+ *
+ * So the calibration keeps a picture of the view its region was fitted in,
+ * and a nudged camera is matched against it. The shift that lines the two up
+ * is the shift the region needs. Matched on EDGES rather than brightness, so a
+ * lighting change does not read as movement, and with the region itself left
+ * out, because that is exactly the part of the view that changes as a bobbin
+ * runs down. Only a shift is found: a nudge slides the view; a camera re-aimed
+ * from a new angle or distance changes its shape, and that still needs the
+ * full calibration -- which a poor match says rather than guessing.
+ *
+ * Coarse to fine: every shift up to ALIGN_MAX_SHIFT of the frame at 1/4 size,
+ * then refined at 1/2 and full. The answer is in 320-wide cells -- 4 px of a
+ * 1280 frame. */
+const VIEW_W = 320;
+const ALIGN_MAX_SHIFT = 0.25;     // of the frame, either way
+/* The two gates, measured 18 Nov on the vid1 depletion clip (576x1024) with the
+   tablet's nudge simulated by cutting windows at known offsets. Every honest
+   case -- slid up to 32 px, the bobbin run down to 67% bare since calibrating,
+   lighting dimmed or brightened, a 1 degree tilt -- scored 0.74 or more with a
+   margin of 0.10 or more, found the shift within 2 px, and read the tube
+   within 0.1 of the true region. The wrong answers -- a 3 degree tilt slid
+   29 px off, a different scene -- scored 0.57 or less with a margin of 0.02 or
+   less. A 2 degree tilt landed between (0.63, 0.05) and is refused: right, as
+   it happens, but too close to call, and refusing sends the operator to the
+   full calibration rather than measuring the wrong pixels. One clip; the
+   tablet's own footage should re-check these. */
+const ALIGN_MIN_SCORE = 0.6;      // correlation of the edges at the best shift
+const ALIGN_MIN_MARGIN = 0.07;    // best over the next separate peak: one clear answer
+
+/* A small grey picture of the view: what a region is aligned against. */
+function viewOf(imageData, w = VIEW_W) {
+  const h = Math.max(8, Math.round((w * imageData.height) / imageData.width));
+  return { w, h, g: downsampleGray(imageData, w, h) };
+}
+
+function halveView(v) {
+  const w = v.w >> 1, h = v.h >> 1, g = new Float32Array(w * h);
+  for (let y = 0; y < h; y++)
+    for (let x = 0; x < w; x++) {
+      const i = 2 * y * v.w + 2 * x;
+      g[y * w + x] = (v.g[i] + v.g[i + 1] + v.g[i + v.w] + v.g[i + v.w + 1]) / 4;
+    }
+  return { w, h, g };
+}
+
+function edgesOf(v) {
+  const { w, h, g } = v, e = new Float32Array(w * h);
+  for (let y = 1; y < h - 1; y++)
+    for (let x = 1; x < w - 1; x++) {
+      const i = y * w + x;
+      e[i] = Math.abs(g[i + 1] - g[i - 1]) + Math.abs(g[i + w] - g[i - w]);
+    }
+  return { w, h, g: e };
+}
+
+/* Which cells of a w x h view take part: all but the tube region, widened by
+   three of its half-widths -- the bobbin's own outline changes as it unwinds. */
+function alignKeep(cal, w, h) {
+  const keep = new Uint8Array(w * h).fill(1);
+  if (!cal) return keep;
+  const cs = rectCorners(toRect(cal, w, h));
+  const pad = 3 * cal.halfWidth * h + 2;
+  const x0 = Math.max(0, Math.floor(Math.min(...cs.map(p => p[0])) - pad));
+  const x1 = Math.min(w - 1, Math.ceil(Math.max(...cs.map(p => p[0])) + pad));
+  const y0 = Math.max(0, Math.floor(Math.min(...cs.map(p => p[1])) - pad));
+  const y1 = Math.min(h - 1, Math.ceil(Math.max(...cs.map(p => p[1])) + pad));
+  for (let y = y0; y <= y1; y++) keep.fill(0, y * w + x0, y * w + x1 + 1);
+  return keep;
+}
+
+/* Correlation of reference edges a(x, y) with current edges b(x+dx, y+dy). */
+function edgeMatch(a, b, dx, dy, keep) {
+  let n = 0, sa = 0, sb = 0, saa = 0, sbb = 0, sab = 0;
+  const x0 = Math.max(1, 1 - dx), x1 = Math.min(a.w - 1, a.w - 1 - dx);
+  const y0 = Math.max(1, 1 - dy), y1 = Math.min(a.h - 1, a.h - 1 - dy);
+  for (let y = y0; y < y1; y++)
+    for (let x = x0; x < x1; x++) {
+      const i = y * a.w + x;
+      if (!keep[i]) continue;
+      const p = a.g[i], q = b.g[(y + dy) * b.w + x + dx];
+      n++; sa += p; sb += q; saa += p * p; sbb += q * q; sab += p * q;
+    }
+  if (n < 0.2 * a.w * a.h) return -1;        // too little left to compare
+  const va = saa - (sa * sa) / n, vb = sbb - (sb * sb) / n;
+  return va > 0 && vb > 0 ? (sab - (sa * sb) / n) / Math.sqrt(va * vb) : -1;
+}
+
+/* How far the current view has slid from the reference. Returns the shift as
+   fractions of the frame, how well it matched, and whether that is good enough
+   to act on -- with the reason when it is not. */
+function alignTo(ref, cur, cal, { maxShift = ALIGN_MAX_SHIFT, minScore = ALIGN_MIN_SCORE,
+                                  minMargin = ALIGN_MIN_MARGIN } = {}) {
+  const out = { ok: false, dx: 0, dy: 0, score: -1, margin: 0, why: "" };
+  if (!ref || !cur || ref.w !== cur.w || ref.h !== cur.h) {
+    out.why = "the camera's picture is a different shape from the one the tube was fitted in";
+    return out;
+  }
+  const levels = [[ref, cur]];
+  while (levels.length < 3) {
+    const [r, c] = levels[levels.length - 1];
+    levels.push([halveView(r), halveView(c)]);
+  }
+  const E = levels.map(([r, c]) => [edgesOf(r), edgesOf(c), alignKeep(cal, r.w, r.h)]);
+
+  /* Coarsest: every shift in range. The runner-up has to be a separate PEAK --
+     edges change smoothly, so the shift next door to the right one scores
+     nearly as well, and comparing against that measured nothing but the slope.
+     A view with a second place it fits nearly as well is the ambiguity worth
+     refusing: a repeating pattern, a featureless wall. */
+  const [a2, b2, k2] = E[2];
+  const rx = Math.round(maxShift * a2.w), ry = Math.round(maxShift * a2.h), sw = 2 * rx + 1;
+  const grid = new Float32Array(sw * (2 * ry + 1));
+  for (let dy = -ry; dy <= ry; dy++)
+    for (let dx = -rx; dx <= rx; dx++) grid[(dy + ry) * sw + dx + rx] = edgeMatch(a2, b2, dx, dy, k2);
+  let best = -2, bx = 0, by = 0;
+  for (let i = 0; i < grid.length; i++)
+    if (grid[i] > best) { best = grid[i]; bx = (i % sw) - rx; by = Math.floor(i / sw) - ry; }
+  let second = -1;
+  for (let y = 1; y < 2 * ry; y++)
+    for (let x = 1; x < sw - 1; x++) {
+      const v = grid[y * sw + x], dx = x - rx, dy = y - ry;
+      if (Math.max(Math.abs(dx - bx), Math.abs(dy - by)) <= 2) continue;   // the best peak's own slope
+      let peak = true;
+      for (let j = -1; j <= 1 && peak; j++)
+        for (let i = -1; i <= 1; i++) if ((i || j) && grid[(y + j) * sw + x + i] > v) { peak = false; break; }
+      if (peak && v > second) second = v;
+    }
+  out.margin = best - second;
+
+  // then refine at each finer level around twice the coarser answer
+  for (const L of [1, 0]) {
+    const [a, b, k] = E[L];
+    let top = [-2, 2 * bx, 2 * by];
+    for (let dy = 2 * by - 2; dy <= 2 * by + 2; dy++)
+      for (let dx = 2 * bx - 2; dx <= 2 * bx + 2; dx++) {
+        const s = edgeMatch(a, b, dx, dy, k);
+        if (s > top[0]) top = [s, dx, dy];
+      }
+    [best, bx, by] = top;
+  }
+  out.score = best; out.dx = bx / ref.w; out.dy = by / ref.h;
+  if (out.score < minScore)
+    out.why = `the view matches the calibration only weakly (${out.score.toFixed(2)}, need ${minScore}) — ` +
+              `the camera has turned or moved too far to slide the tube region back`;
+  else if (out.margin < minMargin)
+    out.why = `the view matches more than one place about equally well — too ambiguous to trust`;
+  else out.ok = true;
+  return out;
+}
+
+/* The same region, slid by fractions (fx, fy) of the frame -- or null if too
+   much of it would leave the picture. A region already running to the frame's
+   edge, as a wide one does, loses a sliver to any sideways slide and still
+   measures the tube; one pushed half out of view does not. */
+const ALIGN_MIN_INSIDE = 0.85;    // of the region that must stay in the picture
+function shiftCal(cal, fx, fy) {
+  const moved = { ...cal, p1: [cal.p1[0] + fx, cal.p1[1] + fy], p2: [cal.p2[0] + fx, cal.p2[1] + fy] };
+  const r = toRect(moved, 1, 1);
+  let inside = 0, n = 0;
+  for (let i = 0; i <= 20; i++)
+    for (let j = -10; j <= 10; j++) {
+      const t = (i / 20) * r.L, w = (j / 10) * r.hw;
+      const x = r.p1[0] + r.u[0] * t + r.n[0] * w, y = r.p1[1] + r.u[1] * t + r.n[1] * w;
+      n++; if (x >= 0 && x <= 1 && y >= 0 && y <= 1) inside++;
+    }
+  return inside / n >= ALIGN_MIN_INSIDE ? moved : null;
+}
+
+/* A view as a short string for storage, and back: 320x180 grey is 77 KB. */
+function packView(v) {
+  let s = "";
+  for (let i = 0; i < v.g.length; i++) s += String.fromCharCode(Math.max(0, Math.min(255, Math.round(v.g[i]))));
+  return { w: v.w, h: v.h, data: btoa(s) };
+}
+function unpackView(p) {
+  if (!p || !p.data) return null;
+  const s = atob(p.data), g = new Float32Array(s.length);
+  for (let i = 0; i < s.length; i++) g[i] = s.charCodeAt(i);
+  return g.length === p.w * p.h ? { w: p.w, h: p.h, g } : null;
+}
+
 const CV = { ARM_MIN_LEVEL, ARM_MIN_RATIO, ARM_MIN_SURROUND,
              hotMask, levelOver, armingDecision,
              GAIN_MIN, CREAM_WARM, BAND_FRACTION, BASELINE_MAX, CEILING_MIN,
@@ -908,7 +1095,9 @@ const CV = { ARM_MIN_LEVEL, ARM_MIN_RATIO, ARM_MIN_SURROUND,
              roiWarmthValues, regionFrom, madSigma, creamThresholdFor,
              fitInto, aspectMismatch,
              toRect, rectCorners, measure, calibrate, driftCheck, downsampleGray,
-             roiGray, meanAbsDiff, };
+             roiGray, meanAbsDiff,
+             VIEW_W, ALIGN_MAX_SHIFT, ALIGN_MIN_SCORE, ALIGN_MIN_MARGIN,
+             viewOf, alignTo, alignKeep, shiftCal, packView, unpackView, };
 
 if (typeof module !== "undefined" && module.exports) module.exports = CV;
 if (typeof window !== "undefined") window.CV = CV;
