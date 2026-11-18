@@ -834,7 +834,7 @@ function armingDecision({ frames, floor, cols, rows, hotFrac, minMask,
                           minSurround = ARM_MIN_SURROUND }) {
   const n = frames ? frames.length : 0;
   const mask = hotMask(frames, floor, hotFrac);
-  const out = { mask: null, outside: null, stopAt: null, level: null,
+  const out = { mask: null, outside: null, stopAt: null, level: null, lateLevel: null,
                 heldLevel: null, surround: null, ratio: null, frameShare: null,
                 maskSize: mask.length, samples: n, ok: false, why: "" };
   if (n < 4) { out.why = "too few frames in the warm-up"; return out; }
@@ -852,7 +852,14 @@ function armingDecision({ frames, floor, cols, rows, hotFrac, minMask,
   const half = Math.floor(n / 2);
   const fit = frames.slice(0, half), test = frames.slice(half);
   const fitMask = hotMask(fit, floor, hotFrac);
-  out.level = levelOver(frames, mask, floor);          // in-sample: the threshold
+  out.level = levelOver(frames, mask, floor);          // in-sample, the whole window
+  /* The same, over the window's second half only. When the bobbin starts part
+     way through the window, the whole-window q25 lands on a still sample and the
+     threshold comes out under a stopped machine's own flicker: bobbin 5, 18 Nov,
+     read a still machine as running in 50 bursts. The second half is where it
+     was surely turning, so the threshold is set from whichever is higher. For a
+     bobbin turning throughout the two agree and nothing changes. */
+  out.lateLevel = levelOver(frames.slice(half), mask, floor);
   const grid = cols * rows;
   out.frameShare = grid > 0 ? mask.length / grid : 0;
   let surroundIdx = [];
@@ -884,7 +891,7 @@ function armingDecision({ frames, floor, cols, rows, hotFrac, minMask,
               `against ${out.surround.toFixed(1)}% around it, ${out.ratio.toFixed(1)}x, need ${minRatio}x`;
     return out;
   }
-  const stopAt = cfStopThresholdFrom(out.level);
+  const stopAt = cfStopThresholdFrom(Math.max(out.level, out.lateLevel ?? 0));
   if (stopAt === null) {
     out.why = `running level ${out.level.toFixed(1)}% is under ${CF_RUNNING_MIN}%`;
     return out;

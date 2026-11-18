@@ -401,8 +401,8 @@ const gctx = grab.getContext("2d", { willReadFrequently: true });
    time at the machine more than once: the service worker is cache-first, so a
    reload can show the old shell while the new one installs behind it. A build
    string settles that in a glance instead of by hunting for a changed word. */
-const VERSION = "1.3.0";
-const BUILD = "143e422";        // rewritten on publish; "dev" means a local checkout
+const VERSION = "1.4.0";
+const BUILD = "9454a98";        // rewritten on publish; "dev" means a local checkout
 
 const SAMPLE_S = 0.5;        // seconds between samples, in SOURCE time
 const MEDIAN_WINDOW = 5;     // smooth before the clamp, so one spike cannot ratchet
@@ -478,6 +478,30 @@ const SAY_TEXT  = { low: "Bobbin low", stopped: "Machine stopped" };
    running machine is unambiguous once it has run for a couple of seconds, and
    the cost of clearing late is only that the screen stays up a moment longer. */
 const RESUME_HOLD = 2;
+
+/* Quiet needed before a stop is declared -- recorded and alarmed. It was zero:
+   the stop fired on the first quiet sample, because the reference clip had shown
+   a 27-fold gap between running and stopped readings. On the tablet the typical
+   readings differ about 4-fold (18 Nov), and bobbin 3 raised 23 "Machine
+   stopped" alarms in four minutes, 21 of them gone within 3 s -- dips of one or
+   two samples, each a full alarm with a push to the phone. Two samples, not
+   three: the shortest real stop on the reference clip (63.0-65.1 s, labelled by
+   eye) reads quiet on only two, because the samples either side catch the
+   bobbin slowing and speeding up. So this swallows every one-sample dip -- at
+   least 16 of those 23 -- and loses no real stop. The stop is dated back to its
+   first quiet sample, so the records keep the true time; only the alarm is half
+   a second later, against a target of a minute. */
+const STOP_HOLD = 1;
+
+/* A mask armed as a tow join closes must show the bobbin turning for this long
+   before it is trusted. The join moves the bobbin in bursts, and on 18 Nov the
+   last burst was still going when the window closed (tow-trace-2026-11-18-05-10
+   .mkv): the app learned it as running, armed at 112.1 s, and the movement
+   stopped half a second later. The real run began at 123 s, and the mask then
+   flickered against it for four minutes, 23 alarms. A mask that goes quiet this
+   soon after the join was learned on the join, so it is dropped and learned
+   again. A real stop in that time still gets its alarm, from the relearning. */
+const JOIN_PROBATION_S = 10;
 
 /* Stop detection measures a learned set of pixels, not the depletion region.
  *
@@ -555,11 +579,18 @@ const MIN_MASK = 50;        // fewer sampled pixels than this and the count is n
  * cannot be left on. Ending on the timeout is said aloud, because the operator
  * may still be inside the machine and should know the camera is back.
  *
+ * It was 5 minutes. On 18 Nov one was left on mid-run and ran out the clock:
+ * restarts are not believed while it is on, so all 300 s were booked as a
+ * breakdown, whatever the machine did. The other seven that day lasted 15 to
+ * 145 s, median 25. So it is 3 minutes now, and every INTERVENTION_REMIND_S it
+ * stays on it says so, while the operator can still press it.
+ *
  * Once it ends, a stopped machine gets AFTER_INTERVENTION_S before it raises
  * the stop alert. Without that, closing the door and pressing the button would
  * set off "machine stopped" in the operator's face, every time, before they had
  * reached the start button. */
-const INTERVENTION_MAX_S = 300;
+const INTERVENTION_MAX_S = 180;
+const INTERVENTION_REMIND_S = 60;
 const AFTER_INTERVENTION_S = 60;
 
 
@@ -640,6 +671,7 @@ let restoredGap = null;             // what the last restore charged to being aw
 const GAP_MIN_S = 10;               // under this, a reload is not worth a pair of events
 let machineMoving = false;        // the recorded state, not the alert state
 let lastStopAt = null;            // when MOTION_STOPPED was last written; floors the backdate below
+let lastStartAt = null;           // when MOTION_STARTED was last written; floors a stop's backdate
 let prevMotion = null, hotCount = null, warmSamples = 0, warmFrames = [];
 let armAttempts = 0;        // arming retries on this run; 0 once it has armed
 
@@ -679,9 +711,14 @@ const shotCtx = shotCv.getContext("2d");
    refusal to arm into "the machine never started". joinAlarmed stops that alarm
    firing again on each retry. */
 let joinUntil = null, joinWaiting = false, joinAlarmed = false;
+/* probationUntil: when the mask armed at a join's close stops being on trial
+   (JOIN_PROBATION_S). joinReopened: that mask was dropped, so the join's end is
+   already in the log and must not be written twice. */
+let probationUntil = 0, joinReopened = false;
 let motionMask = null, maskBuf = null, prevMaskBuf = null;
 let motionOutside = null, outBuf = null, prevOutBuf = null;   // the frame around the mask
 let attendedSince = null, attendTimer = null, attendTicker = null, alertHoldUntil = 0;
+let attendReminder = null;
 let hiddenSince = null;             // set while the page is in the background
 
 /* ---- setup restore ---------------------------------------------------- */
@@ -879,20 +916,30 @@ async function lockCamera({ settle = CAM_SETTLE_MS } = {}) {
         : "this browser does not report camera capabilities" });
   }
 
-  /* One at a time, so a rejection costs only the one it was for. */
-  const got = [];
+  /* One at a time, so a rejection costs only the one it was for. And a lock
+     counts only once the camera's own settings show it. Chrome treats an
+     `advanced` constraint it cannot meet as optional and skips it without an
+     error, so "applyConstraints did not throw" proves nothing: on 18 Nov this
+     reported white balance locked while every recording that day says
+     "continuous". */
+  const got = [], unconfirmed = [];
   for (const k of asked) {
-    try { await track.applyConstraints({ advanced: [{ [k]: want[k] }] }); got.push(k); }
-    catch { /* unsupported in practice despite being advertised */ }
+    try { await track.applyConstraints({ advanced: [{ [k]: want[k] }] }); }
+    catch { continue; /* refused outright, despite being advertised */ }
+    let now = {};
+    try { now = track.getSettings ? track.getSettings() : {}; } catch {}
+    (now[k] === want[k] ? got : unconfirmed).push(k);
   }
   let settings = {};
   try { settings = track.getSettings ? track.getSettings() : {}; } catch {}
-  camLock = { ok: got.length > 0, asked, got, caps: Object.keys(caps),
-    why: got.length ? "" : "the camera refused every lock it advertised",
+  camLock = { ok: got.length > 0, asked, got, unconfirmed, caps: Object.keys(caps),
+    why: got.length ? ""
+       : unconfirmed.length ? "the camera accepted the locks but did not apply them"
+       : "the camera refused every lock it advertised",
     exposureTime: settings.exposureTime ?? null,
     iso: settings.iso ?? null,
     colorTemperature: settings.colorTemperature ?? null };
-  log?.add(Shift.EV.CAMERA_LOCKED, { got, asked });
+  log?.add(Shift.EV.CAMERA_LOCKED, { got, asked, unconfirmed });
   return camLock;
 }
 
@@ -903,8 +950,11 @@ function paintCamLock() {
   n.textContent = camLock.ok
     ? `Camera locked: ${camLock.got.join(", ")}.` +
       (camLock.exposureTime ? ` Exposure ${camLock.exposureTime}, ISO ${camLock.iso ?? "?"}.` : "") +
-      (camLock.asked.length > camLock.got.length
-        ? ` Refused: ${camLock.asked.filter(k => !camLock.got.includes(k)).join(", ")}.` : "")
+      ((camLock.unconfirmed || []).length
+        ? ` Accepted but not applied: ${camLock.unconfirmed.join(", ")}.` : "") +
+      (camLock.asked.filter(k => !camLock.got.includes(k) && !(camLock.unconfirmed || []).includes(k)).length
+        ? ` Refused: ${camLock.asked.filter(k => !camLock.got.includes(k) &&
+                                              !(camLock.unconfirmed || []).includes(k)).join(", ")}.` : "")
     : `Camera NOT locked — ${camLock.why}. ` +
       `Exposure and white balance will keep drifting; lock them in the camera app if it allows it.`;
 }
@@ -1132,6 +1182,7 @@ function relearnMotion() {
   motionOutside = null; outBuf = prevOutBuf = null;
   stopAt = undefined; hotCount = null; warmSamples = 0; warmFrames = []; armAttempts = 0;
   prevMotion = null; prevFull = null; prevGrid = null; movingFor = 0; quietFor = 0;
+  probationUntil = 0;     // the trial was for the mask just dropped
 }
 
 $("realignBtn").onclick = () => {
@@ -1339,6 +1390,7 @@ $("reset").onclick = () => {
   // A swap is the commonest reason to be at the machine, and Reset is the last
   // thing done before walking away, so it ends the intervention too.
   endIntervention("reset");
+  closeMotion("reset");             // before RUN_RESET, so the stop belongs to the bobbin it ends
   log?.add(Shift.EV.RUN_RESET, { peakPct: +clamped.toFixed(1) });
   machineMoving = false;
   traceShot("reset pressed");
@@ -1370,7 +1422,7 @@ function resetRun() {
   stopAt = undefined;
   noiseFloor = null; noiseSamples = []; prevFull = null;
   prevMotion = null; hotCount = null; warmSamples = 0; warmFrames = [];
-  armAttempts = 0;
+  armAttempts = 0; probationUntil = 0;
   motionMask = null; maskBuf = prevMaskBuf = null;
   motionOutside = null; outBuf = prevOutBuf = null;
   /* Whatever alert is up, not just a stop. Reset means a new scrap bobbin is
@@ -1403,14 +1455,15 @@ function openJoin() {
      No detector, no knowledge: the join goes unmeasured instead of mismeasured. */
   if (!running || !faultOn) return;
   joinUntil = performance.now() / 1000 + joinWindow;
-  joinWaiting = false; joinAlarmed = false;
+  joinWaiting = false; joinAlarmed = false; joinReopened = false; probationUntil = 0;
   log?.add(Shift.EV.JOIN_STARTED);
 }
 
 function closeJoin(by) {
   if (joinUntil === null && !joinWaiting) return;
-  joinUntil = null; joinWaiting = false; joinAlarmed = false;
-  log?.add(Shift.EV.JOIN_ENDED, { by });
+  const logged = joinReopened;
+  joinUntil = null; joinWaiting = false; joinAlarmed = false; joinReopened = false;
+  if (!logged) log?.add(Shift.EV.JOIN_ENDED, { by });
 }
 
 /* % the current frame may already read before we refuse to treat it as a full
@@ -1782,6 +1835,26 @@ function checkStopped(img, grid) {
     joinWaiting = true;
   }
 
+  /* Operator at the machine: hold the learning phase, the way the join holds
+     it. What moves while the door is open is the operator, so a mask learned
+     then is a mask of their hands. On 18 Nov that happened twice: after a join
+     the app kept trying to arm, one round fell inside the intervention, and
+     once the hands left the turning bobbin barely registered -- "Machine
+     stopped" for 623 s on bobbin 6 while it ran down, and 147 s of breakdowns
+     on bobbin 15. The clock is pinned, so the round that follows starts fresh
+     when the door shuts, on the bobbin alone. Only before arming: a mask that
+     is already armed was learned on the machine, and the stop logic below
+     already ignores the camera while someone is at the machine. */
+  if (attendedSince !== null && stopAt === undefined) {
+    runStartedAt = performance.now() / 1000 - NOISE_WARMUP;
+    hotCount = null; warmSamples = 0; warmFrames = [];
+    prevMotion = motion; prevFull = full; prevGrid = grid;
+    traceSet("phase", "attended");
+    $("mMotion").textContent = "learning waits · operator at the machine";
+    $("mMotion").style.color = "";
+    return;
+  }
+
   /* Phase 2: learn WHICH pixels move and HOW MUCH they move while running.
      Both are per-device and per-framing, so neither can be a constant. The
      frames are kept because the running level can only be measured once the
@@ -1834,7 +1907,7 @@ function checkStopped(img, grid) {
         t: Math.round((performance.now() / 1000 - trace.clock0) * 10) / 10,
         attempt: armAttempts, ok: decision.ok, why: decision.why,
         maskSize: decision.maskSize, samples: decision.samples,
-        level: decision.level, heldLevel: decision.heldLevel,
+        level: decision.level, lateLevel: decision.lateLevel, heldLevel: decision.heldLevel,
         surround: decision.surround,
         ratio: decision.ratio === Infinity ? null : decision.ratio,
         frameShare: decision.frameShare, stopAt: decision.stopAt,
@@ -1845,6 +1918,13 @@ function checkStopped(img, grid) {
     }
 
     if (decision.ok) {
+      /* On the record, so a bobbin's threshold can be checked afterwards. */
+      const r1 = x => (typeof x === "number" && isFinite(x) ? Math.round(x * 10) / 10 : null);
+      log?.add(Shift.EV.MOTION_ARMED, {
+        attempt: armAttempts, maskSize: decision.maskSize, level: r1(decision.level),
+        lateLevel: r1(decision.lateLevel),
+        heldLevel: r1(decision.heldLevel), ratio: r1(decision.ratio), stopAt: r1(decision.stopAt),
+        floor: r1(noiseFloor), afterJoin: joinWaiting });
       motionMask = decision.mask;
       stopAt = decision.stopAt;
       maskBuf = new Float32Array(motionMask.length);
@@ -1866,7 +1946,10 @@ function checkStopped(img, grid) {
          turning. If the alarm had already gone off for a join that looked dead,
          leave faultFired set -- the ordinary self-clear below sees RESUME_HOLD
          of motion and withdraws it, the same path a real stop takes. */
-      if (joinWaiting) closeJoin("motion");
+      if (joinWaiting) {
+        closeJoin("motion");
+        probationUntil = performance.now() / 1000 + JOIN_PROBATION_S;
+      }
 
     } else {
       /* REFUSED -- and then try again, rather than giving up for the rest of
@@ -1952,7 +2035,11 @@ function checkStopped(img, grid) {
      it cannot run with the door open. */
   const attended = attendedSince !== null;
   const machineLike = m >= stopAt && CV.concentrated(m, o);
-  quietFor = m < stopAt ? quietFor + SAMPLE_S : 0;
+  /* Only movement that looks like the machine ends a quiet stretch. A hand over
+     the bobbin during a stop moves the mask too, on single samples, and with
+     STOP_HOLD that was enough to keep the stop from ever being declared. It
+     neither adds to the quiet nor resets it: it says nothing about the bobbin. */
+  quietFor = m < stopAt ? quietFor + SAMPLE_S : machineLike ? 0 : quietFor;
   movingFor = machineLike && !attended ? movingFor + SAMPLE_S : 0;
 
   /* Record the machine's state before any of the suppressions below. The stop
@@ -1961,10 +2048,11 @@ function checkStopped(img, grid) {
      the alerting path deliberately stays quiet about. Detecting and notifying
      are different jobs; this is the detecting one.
 
-     A stop is recorded on the first quiet sample, the same instant the alert
-     would fire. A restart needs RESUME_HOLD of sustained motion so a single
-     noisy frame cannot fake one, and is backdated by that hold so the recorded
-     time is when the machine actually moved, not when we were convinced.
+     A stop needs STOP_HOLD of quiet and a restart RESUME_HOLD of sustained
+     motion, so a noisy frame or two can fake neither. Each is backdated -- the
+     stop to its first quiet sample, the restart by its hold -- so the recorded
+     time is when the machine actually changed, not when we were convinced. A
+     stop's backdate is floored at the restart before it, for the reason below.
 
      That backdate is floored at the last stop, and it has to be. The hold is
      counted in SAMPLE_S units off `movingFor`, but subtracted as a flat
@@ -1984,18 +2072,41 @@ function checkStopped(img, grid) {
      at 40% in the rush apart from the real one at 99%. The surround is kept on
      both, so a restart that should not have been believed can be found later. */
   const around = o === null ? null : +o.toFixed(1);
-  if (machineMoving && quietFor > 0) {
+  // the first quiet sample of the current quiet stretch
+  const quietSince = Date.now() - Math.max(0, quietFor - SAMPLE_S) * 1000;
+  if (machineMoving && quietFor >= STOP_HOLD) {
     machineMoving = false;
+    const at = lastStartAt === null ? quietSince : Math.max(quietSince, lastStartAt + 1);
     // the event's own t, so the floor below is on the same clock add() used
     lastStopAt = log?.add(Shift.EV.MOTION_STOPPED,
-                          { pct: +clamped.toFixed(1), outside: around })?.t ?? Date.now();
+                          { pct: +clamped.toFixed(1), outside: around }, at)?.t ?? at;
   } else if (!machineMoving && movingFor >= RESUME_HOLD) {
     machineMoving = true;
     alertHoldUntil = 0;     // the hold covered the stop the operator dealt with, not the next
     const backdated = Date.now() - RESUME_HOLD * 1000;
-    log?.add(Shift.EV.MOTION_STARTED, { level: +m.toFixed(1), outside: around },
-             lastStopAt === null ? backdated : Math.max(backdated, lastStopAt + 1));
+    const at = lastStopAt === null ? backdated : Math.max(backdated, lastStopAt + 1);
+    lastStartAt = log?.add(Shift.EV.MOTION_STARTED, { level: +m.toFixed(1), outside: around },
+                           at)?.t ?? at;
   }
+  /* On probation after a join (JOIN_PROBATION_S), quiet means the mask was
+     learned on the join's own movement. Drop it and learn again, still waiting
+     for the bobbin to turn: if it does not, the next refusal raises "Bobbin not
+     turning" as any join would. Any stop the machine made is already recorded
+     above; only the alarm, which would be about the wrong pixels, is skipped. */
+  if (quietFor >= STOP_HOLD && performance.now() / 1000 < probationUntil) {
+    probationUntil = 0;
+    motionMask = null; stopAt = undefined; maskBuf = prevMaskBuf = null;
+    motionOutside = null; outBuf = prevOutBuf = null;
+    hotCount = null; warmSamples = 0; warmFrames = [];
+    runStartedAt = performance.now() / 1000 - NOISE_WARMUP;
+    quietFor = 0; movingFor = 0;
+    joinWaiting = true; joinReopened = true;
+    $("faultNote").className = "note";
+    $("faultNote").textContent =
+      "Stop detection had learned the tow join's own movement — learning again on the bobbin.";
+    return;
+  }
+
   /* "around" is the surround's figure. When the mask is moving but the
      surround is moving too, say that it is being discounted -- otherwise a
      detector refusing a hand looks exactly like one failing to see a restart. */
@@ -2046,13 +2157,12 @@ function checkStopped(img, grid) {
   // A paused or finished clip is not a stopped machine.
   if (source === "file" && (vid.paused || vid.ended)) return;
 
-  /* Fire on the first quiet sample rather than holding. The hold existed
-     because the old motion measure's running and stopped bands overlapped, so
-     a single sample meant nothing; counting changed pixels separates them by
-     27x and produced no false quiet in 109 running samples, which makes the
-     delay cost without benefit. A stop is reported within one sample -- half
-     a second -- and the repeat interval below carries it from there. */
-  if (quietFor > 0) { faultFired = true; stoppedSince = Date.now(); fireFault(); }
+  /* Fire once the quiet has lasted STOP_HOLD. This fired on the first quiet
+     sample for a while, on the strength of a 27-fold gap measured on the
+     reference clip; the tablet's own footage has about 4-fold, and single-sample
+     dips became full alarms (see STOP_HOLD). The repeat interval carries the
+     alarm from here. */
+  if (quietFor >= STOP_HOLD) { faultFired = true; stoppedSince = quietSince; fireFault(); }
 }
 
 function clearFault() {
@@ -2815,6 +2925,9 @@ function startIntervention() {
   movingFor = 0;
   attendTimer = setTimeout(() => endIntervention("timeout"), INTERVENTION_MAX_S * 1000);
   attendTicker = setInterval(paintIntervention, 1000);
+  attendReminder = setInterval(() =>
+    speak("Operator intervention is still on. Press it again once the door is shut."),
+    INTERVENTION_REMIND_S * 1000);
   $("attendNote").className = "note warn";
   $("attendNote").textContent = "Operator at the machine — the camera is ignored. " +
     "Press again once the door is shut, or Reset after a swap.";
@@ -2827,6 +2940,7 @@ function endIntervention(by) {
   log?.add(Shift.EV.INTERVENTION_ENDED, { by });
   attendedSince = null;
   clearTimeout(attendTimer); clearInterval(attendTicker); attendTimer = attendTicker = null;
+  clearInterval(attendReminder); attendReminder = null;
   alertHoldUntil = Date.now() + AFTER_INTERVENTION_S * 1000;
   $("attendNote").className = "note" + (by === "timeout" ? " warn" : "");
   $("attendNote").textContent = by === "timeout"
@@ -2853,10 +2967,27 @@ $("attendBtn").onclick = () =>
 
 /* End closes the shift and files it. Only this button does -- switching source
    or losing the camera stops the run without ending anything. */
+/* A button that closes a bobbin -- Reset, or End -- while the detector still
+   thinks the machine is moving. Hands in view during the swap are enough for
+   that. Clearing the flag without a stop left the motion interval OPEN in the
+   log, and the reports then carried it straight through the next bobbin's tow
+   join. On 18 Nov that booked five joins (608 s) as breakdowns, and on bobbin
+   17, whose motion never stopped before Reset, it left no stop to close the
+   bobbin on: the whole bobbin was filed as a 731 s swap with no running and
+   its depletion warning counted as missed. The stop is marked with the button,
+   so the reports can tell it from one the machine made. */
+function closeMotion(by) {
+  if (!machineMoving) return;
+  machineMoving = false;
+  lastStopAt = log?.add(Shift.EV.MOTION_STOPPED,
+                        { pct: +clamped.toFixed(1), outside: null, by })?.t ?? Date.now();
+}
+
 function endShift() {
   if (log) {
     endIntervention("end");
     closeJoin("end");       // before shift.ended, so the window lands inside the shift
+    closeMotion("end");
     log.add(Shift.EV.SHIFT_ENDED, { peakPct: +clamped.toFixed(1) });
     const { shift } = log.derive({ now: Date.now() });
     /* Keep the events, not just the summary. The rules that turn one into the

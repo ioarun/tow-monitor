@@ -9,7 +9,7 @@
  * files without changing it ships nothing to the device. The publish
  * workflow rewrites this line with the source commit, so it cannot be
  * forgotten; the value here is only what a local checkout uses. */
-const CACHE = "tow-monitor-143e422";
+const CACHE = "tow-monitor-9454a98";
 /* The icons are in the shell too: an installed app whose icon 404s on a
    workshop with no connectivity is an app with no icon. */
 const SHELL = ["./", "./index.html", "./cv.js", "./shift.js", "./manifest.webmanifest",

@@ -26,7 +26,7 @@ const EV = {
   RUN_STARTED:            "run.started",
   RUN_RESET:              "run.reset",             // { peakPct } -- of the run it closes
   MOTION_STARTED:         "motion.started",        // { level, outside }
-  MOTION_STOPPED:         "motion.stopped",        // { pct, outside }
+  MOTION_STOPPED:         "motion.stopped",        // { pct, outside, by? } by: intervention | reset | end
   DEPLETION_ALERTED:      "depletion.alerted",     // { pct }
   DEPLETION_ACKNOWLEDGED: "depletion.acknowledged",
   STOP_ALERTED:           "stop.alerted",
@@ -40,12 +40,18 @@ const EV = {
   APP_RESUMED:            "app.resumed",           // { hiddenFor } seconds it was away
   JOIN_STARTED:           "join.started",          // Reset: the tow is being joined
   JOIN_ENDED:             "join.ended",            // { by: "motion" | "reset" | "end" | "stopped" }
-  CAMERA_LOCKED:          "camera.locked",         // { got, asked } exposure/WB/focus
+  CAMERA_LOCKED:          "camera.locked",         // { got, asked, unconfirmed } exposure/WB/focus
   /* A raw video was recorded. Nothing derived from the log reads these; they
      are here so a video can be lined up against everything else the shift
      recorded, to the millisecond, by whoever analyses it. */
   VIDEO_STARTED:          "video.started",         // { file, mime, bps, locked, settings }
   VIDEO_STOPPED:          "video.stopped",         // { file, seconds, bytes, by }
+  /* Stop detection armed: the figures it will judge the machine by. Nothing
+     derived reads it. On 18 Nov bobbin 5 read a still machine as running in 50
+     short bursts, and whether its threshold came out too low could not be
+     checked -- arming was recorded only in diagnostic traces, and none covered
+     it. With this, every bobbin's threshold is in the shift log. */
+  MOTION_ARMED:           "motion.armed",          // { attempt, maskSize, level, lateLevel, heldLevel, ratio, stopAt, floor, afterJoin }
 };
 
 /* A run that ended with no alert is either one we failed to warn about or one
@@ -62,12 +68,18 @@ const MISS_ABOVE_PCT = 50;
  * into the next one. They are independent events that happen to be adjacent. */
 const CLOSERS = [EV.RUN_RESET, EV.SHIFT_ENDED];
 
+/* Tube exposure at which a stop after the depletion warning is the operator's
+   deliberate end of the bobbin, and the swap begins. The lowest on 18 Nov was
+   73.6%; an early stop "in the rush" sits well under it. */
+const DELIBERATE_STOP_PCT = 70;
+
 /* Stops the APP caused by not watching, rather than stops the machine made.
  * They are idle either way -- the seconds are real and stay in the figures --
  * but they must never reach faultStops, which is a measure of the MACHINE.
- * A set rather than a string test, because the list has grown twice: the app
- * going to the background (6.7), and then the page being reloaded (6.14). */
-const NOT_THE_MACHINE = new Set(["paused", "reload"]);
+ * A set rather than a string test, because the list keeps growing: the app
+ * going to the background (6.7), the page being reloaded (6.14), and a Reset or
+ * End pressed while the detector still thought the machine was moving. */
+const NOT_THE_MACHINE = new Set(["paused", "reload", "reset", "end"]);
 
 const sum = xs => xs.reduce((a, b) => a + b, 0);
 const secs = ms => Math.round(ms / 100) / 10;      // one decimal, in seconds
@@ -115,9 +127,22 @@ function motionIntervals(events, endT) {
  *
  * A Reset with no stop before it is a mis-press; both edges fall on the press,
  * which keeps runs in order and loses nothing. */
-function boundary(closer, intervals) {
+function boundary(closer, intervals, openedAt = -Infinity) {
   const before = intervals.filter(i => i.end <= closer.t);
-  const closeAt = before.length ? before[before.length - 1].end : closer.t;
+  let last = before.length ? before[before.length - 1] : null;
+  /* The stop a Reset writes when the detector still thought the machine was
+     moving says only "the camera was busy until the press" -- usually hands
+     during the swap. The swap still starts at the machine's own last stop, if
+     this bobbin has one. If it has none, the detector saw this bobbin turning
+     right up to the press, and the press is the only end there is: closing it
+     anywhere earlier lands before the bobbin began and erases it, which is what
+     happened to bobbin 17 on 18 Nov. End's stop is not treated this way: End can
+     be pressed with the machine still running, and that stretch is running. */
+  if (closer.type === EV.RUN_RESET && last && last.stopBy === "reset") {
+    for (let k = before.length - 2; k >= 0; k--)
+      if (before[k].stopBy !== "reset" && before[k].end > openedAt) { last = before[k]; break; }
+  }
+  const closeAt = last ? last.end : closer.t;
   return { closeAt, openAt: closer.t };
 }
 
@@ -157,7 +182,26 @@ function derive(events, { now = null, missAbovePct = MISS_ABOVE_PCT } = {}) {
 
   const raw = motionIntervals(ev, horizon);
   const closers = ev.filter(e => CLOSERS.includes(e.type));
-  const cuts = closers.map(c => ({ closer: c, ...boundary(c, raw) }));
+  const cuts = closers.map((c, k) => ({ closer: c,
+                                        ...boundary(c, raw, k ? closers[k - 1].t : startedAt) }));
+
+  /* The swap starts at your deliberate stop. After the depletion warning the
+     operator stops the machine before the tow comes off, and the swap follows;
+     the swap used to start at the LAST stop before Reset, so whatever the camera
+     took for motion in between -- a gloved hand and the next bobbin's wrap on
+     18 Nov, or a still machine's flicker -- was booked as running: 198 s over 13
+     bobbins that day, 244 s more on bobbin 5. The deliberate stop is the first
+     after the warning at DELIBERATE_STOP_PCT or more; an early stop below it,
+     with the machine running on, stays running. */
+  cuts.forEach((c, k) => {
+    if (c.closer.type !== EV.RUN_RESET) return;
+    const from = k ? closers[k - 1].t : startedAt;
+    const alert = ev.find(e => e.type === EV.DEPLETION_ALERTED && e.t > from && e.t < c.closer.t);
+    if (!alert) return;
+    const stop = raw.find(i => i.end > alert.t && i.end < c.closeAt &&
+                               typeof i.stopPct === "number" && i.stopPct >= DELIBERATE_STOP_PCT);
+    if (stop) c.closeAt = stop.end;
+  });
 
   /* A swap is bounded by a stop and a button press. Whatever moved inside one
      was not the machine making a bobbin, so it is cut out of running time
